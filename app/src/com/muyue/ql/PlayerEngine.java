@@ -1,4 +1,4 @@
-package com.jiaoxiang.fangnale.myui;
+package com.muyue.ql.myui;
 
 import android.content.Context;
 import android.os.Handler;
@@ -19,6 +19,7 @@ public class PlayerEngine {
         void onFailed(String reason);
         void onBuffering(boolean start);
         void onVideoSize(int w, int h);
+        void onNotice(String msg);
     }
 
     public static final int ASPECT_FIT = 0;
@@ -34,6 +35,19 @@ public class PlayerEngine {
     private HtmlContentParser parser;
     private IMediaPlayer player;
     private String decodeMode = "ijk1"; // ijk1=硬解 ijk0=软解 media=系统播放器，默认硬解
+    private boolean autoLineSwitch = true; // 持续缓冲超时自动换线
+    private long bufferingSince;
+    private long lastAutoSwitchAt;
+
+    private final Runnable bufferWatchdog = new Runnable() {
+        public void run() {
+            if (stopped || !autoLineSwitch || bufferingSince == 0) return;
+            if (System.currentTimeMillis() - lastAutoSwitchAt < 25000) return;
+            lastAutoSwitchAt = System.currentTimeMillis();
+            listener.onNotice("当前线路卡顿，自动切换线路");
+            failToNext("卡顿自动换线");
+        }
+    };
     private int aspect = ASPECT_FIT;
 
     private String currentRawUrl;
@@ -264,10 +278,17 @@ public class PlayerEngine {
                 public boolean onInfo(IMediaPlayer mp, int what, int extra) {
                     if (what == IMediaPlayer.MEDIA_INFO_VIDEO_RENDERING_START) {
                         main.removeCallbacks(timeout);
+                        main.removeCallbacks(bufferWatchdog);
+                        bufferingSince = 0;
                         listener.onRendering();
                     } else if (what == IMediaPlayer.MEDIA_INFO_BUFFERING_START) {
+                        bufferingSince = System.currentTimeMillis();
+                        main.removeCallbacks(bufferWatchdog);
+                        main.postDelayed(bufferWatchdog, 12000);
                         listener.onBuffering(true);
                     } else if (what == IMediaPlayer.MEDIA_INFO_BUFFERING_END) {
+                        main.removeCallbacks(bufferWatchdog);
+                        bufferingSince = 0;
                         listener.onBuffering(false);
                     } else if (what == IMediaPlayer.MEDIA_INFO_VIDEO_ROTATION_CHANGED) {
                         listener.onVideoSize(videoW, videoH);
@@ -300,6 +321,8 @@ public class PlayerEngine {
         }
     }
 
+    public void setAutoLineSwitch(boolean v) { autoLineSwitch = v; }
+
     private static boolean hwDecodeHint(String decode) { return "ijk1".equals(decode); }
 
     private void restartCurrent() {
@@ -331,6 +354,8 @@ public class PlayerEngine {
     public void stopAll() {
         stopped = true;
         main.removeCallbacks(timeout);
+        main.removeCallbacks(bufferWatchdog);
+        bufferingSince = 0;
         cancelParser();
         releasePlayer();
     }

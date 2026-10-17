@@ -10,9 +10,9 @@ $J/javac -encoding UTF-8 -source 8 -target 8 -nowarn -cp "../toolchain/android-a
 echo "== javac =="
 rm -rf out_cls && mkdir out_cls
 $J/javac -encoding UTF-8 -source 8 -target 8 -nowarn -cp "out_stub;../toolchain/android-all.jar" -d out_cls $(find src -name "*.java") 2>&1 | grep -v "deprecat\|Xlint" | head -5
-ls out_cls/com/jiaoxiang/fangnale/myui/MainActivity.class > /dev/null || { echo COMPILE_FAILED; exit 1; }
-ls out_cls/com/jiaoxiang/fangnale/myui/PlayerEngine.class > /dev/null || { echo COMPILE_FAILED_ENGINE; exit 1; }
-ls out_cls/com/jiaoxiang/fangnale/myui/OnlineSource.class > /dev/null || { echo COMPILE_FAILED_SOURCE; exit 1; }
+ls out_cls/com/muyue/ql/myui/MainActivity.class > /dev/null || { echo COMPILE_FAILED; exit 1; }
+ls out_cls/com/muyue/ql/myui/PlayerEngine.class > /dev/null || { echo COMPILE_FAILED_ENGINE; exit 1; }
+ls out_cls/com/muyue/ql/myui/OnlineSource.class > /dev/null || { echo COMPILE_FAILED_SOURCE; exit 1; }
 echo "== d8 =="
 rm -f classes7.dex classes.dex
 $J/java -cp ../toolchain/d8.jar com.android.tools.r8.D8 --release --min-api 21 --output . $(find out_cls -name "*.class") 2>/dev/null | head -3 || true

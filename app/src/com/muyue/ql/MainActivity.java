@@ -1,4 +1,4 @@
-package com.jiaoxiang.fangnale.myui;
+package com.muyue.ql.myui;
 
 import android.app.Activity;
 import android.app.AlertDialog;
@@ -61,6 +61,7 @@ public class MainActivity extends Activity implements PlayerEngine.Listener {
     private TextView btnLinePrev, btnLineNext, lineLabel, lineName;
     private ArrayList<TextView> aspectPills = new ArrayList<TextView>();
     private TextView decodeLabel;
+    private TextView autoLineLabel;
 
     private PlayerEngine engine;
     private ChannelStore store;
@@ -514,6 +515,34 @@ public class MainActivity extends Activity implements PlayerEngine.Listener {
         rightContent.addView(decRow, lp(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         refreshDecodeLabel();
 
+        // ---- 卡顿换线（持续缓冲 12 秒自动切下一线路）----
+        TextView alSec = sectionLabel("卡顿换线");
+        alSec.setPadding(dp(4), dp(14), 0, dp(6));
+        rightContent.addView(alSec);
+
+        LinearLayout alRow = new LinearLayout(this);
+        alRow.setOrientation(LinearLayout.HORIZONTAL);
+        alRow.setGravity(Gravity.CENTER_VERTICAL);
+
+        TextView btnAlPrev = circleBtn("‹");
+        btnAlPrev.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) { toggleAutoLine(); }
+        });
+        alRow.addView(btnAlPrev, lp(dp(64), dp(40)));
+
+        autoLineLabel = newText("", 16, COL_TXT);
+        autoLineLabel.setGravity(Gravity.CENTER);
+        alRow.addView(autoLineLabel, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        TextView btnAlNext = circleBtn("›");
+        btnAlNext.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) { toggleAutoLine(); }
+        });
+        alRow.addView(btnAlNext, lp(dp(64), dp(40)));
+
+        rightContent.addView(alRow, lp(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        refreshAutoLineLabel();
+
         // ---- 线路 ----
         TextView lineLabelLp = sectionLabel("线路");
         lineLabelLp.setPadding(dp(4), dp(14), 0, dp(6));
@@ -589,6 +618,19 @@ public class MainActivity extends Activity implements PlayerEngine.Listener {
     private void refreshDecodeLabel() {
         String m = engine.getDecodeMode();
         decodeLabel.setText("ijk1".equals(m) ? "硬解" : "ijk0".equals(m) ? "软解" : "系统播放器");
+    }
+
+    private void refreshAutoLineLabel() {
+        boolean on = prefs().getBoolean("autoline", true);
+        autoLineLabel.setText(on ? "开启" : "关闭");
+    }
+
+    private void toggleAutoLine() {
+        boolean on = !prefs().getBoolean("autoline", true);
+        prefs().edit().putBoolean("autoline", on).apply();
+        engine.setAutoLineSwitch(on);
+        refreshAutoLineLabel();
+        toast(on ? "卡顿自动换线已开启" : "卡顿自动换线已关闭");
     }
 
     private void switchDecode(int delta) {
@@ -810,6 +852,7 @@ public class MainActivity extends Activity implements PlayerEngine.Listener {
 
     private void restorePrefs() {
         engine.setDecodeMode(prefs().getString("decode", "ijk1")); // 默认 ijk1 硬解，URL 提示可覆盖
+        engine.setAutoLineSwitch(prefs().getBoolean("autoline", true));
         engine.setAspect(prefs().getInt("aspect", PlayerEngine.ASPECT_FIT));
         refreshAspectPills();
         refreshDecodeLabel();
@@ -1001,6 +1044,12 @@ public class MainActivity extends Activity implements PlayerEngine.Listener {
 
     public void onVideoSize(int w, int h) {
         applyAspect();
+    }
+
+    public void onNotice(final String msg) {
+        ui.post(new Runnable() { public void run() {
+            showBigOsdStatus(msg);
+        }});
     }
 
     private void showBigOsd(ChannelStore.Channel ch, String status) {
