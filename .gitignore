@@ -1,0 +1,13 @@
+*.apk
+*.dex
+*.class
+out_cls/
+out_stub/
+build/
+original/
+unknown/
+*.jks
+*.keystore
+keystore*
+*.log
+.DS_Store
