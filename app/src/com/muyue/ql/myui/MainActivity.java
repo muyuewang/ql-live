@@ -57,6 +57,15 @@ public class MainActivity extends Activity implements PlayerEngine.Listener {
     private LinearLayout leftPanel;
     private ListView groupList;
     private ListView channelList;
+    // 频道面板手动光标（真机遥控器不依赖系统焦点遍历）
+    private int panelFocusCol = 1; // 0=分组列 1=频道列
+    private int panelGroupPos = 0;
+    private int panelChanPos = 0;
+    // 设置面板手动光标
+    private final java.util.ArrayList<View> rightRows = new java.util.ArrayList<View>();
+    private final java.util.ArrayList<String> rightRowModes = new java.util.ArrayList<String>();
+    private int rightFocusIdx = 0;
+    private ScrollView rightScroll;
     private LinearLayout rightPanel;
     private TextView btnLinePrev, btnLineNext, lineLabel, lineName;
     private ArrayList<TextView> aspectPills = new ArrayList<TextView>();
@@ -513,6 +522,7 @@ public class MainActivity extends Activity implements PlayerEngine.Listener {
         decRow.addView(btnDecNext, lp(dp(64), dp(40)));
 
         rightContent.addView(decRow, lp(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        registerRightRow(decRow, "dec");
         refreshDecodeLabel();
 
         // ---- 卡顿换线（持续缓冲 12 秒自动切下一线路）----
@@ -541,6 +551,7 @@ public class MainActivity extends Activity implements PlayerEngine.Listener {
         alRow.addView(btnAlNext, lp(dp(64), dp(40)));
 
         rightContent.addView(alRow, lp(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        registerRightRow(alRow, "autoline");
         refreshAutoLineLabel();
 
         // ---- 线路 ----
@@ -574,6 +585,7 @@ public class MainActivity extends Activity implements PlayerEngine.Listener {
         lineRow.addView(btnLineNext, lp(dp(64), dp(40)));
 
         rightContent.addView(lineRow, lp(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        registerRightRow(lineRow, "line");
 
         // ---- 画面比例 ----
         TextView aspLabel = sectionLabel("画面比例");
@@ -601,6 +613,7 @@ public class MainActivity extends Activity implements PlayerEngine.Listener {
         }
         refreshAspectPills();
         rightContent.addView(aspRow);
+        registerRightRow(aspRow, "aspect");
 
         // wrap content in scroll, inside the full-height right panel
         rightContent = content;
@@ -608,9 +621,15 @@ public class MainActivity extends Activity implements PlayerEngine.Listener {
         sc.setVerticalScrollBarEnabled(false);
         sc.addView(content, new ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        rightScroll = sc;
         rightPanel.addView(sc, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
         root.addView(rightPanel);
+    }
+
+    private void registerRightRow(View v, String mode) {
+        rightRows.add(v);
+        rightRowModes.add(mode);
     }
 
     private LinearLayout rightContent;
@@ -698,6 +717,8 @@ public class MainActivity extends Activity implements PlayerEngine.Listener {
             }
         });
         rightContent.addView(b);
+        rightRows.add(b);
+        rightRowModes.add("");
         return b;
     }
 
@@ -829,7 +850,9 @@ public class MainActivity extends Activity implements PlayerEngine.Listener {
         });
     }
 
-    private void selectGroup(int idx) {
+    private void selectGroup(int idx) { loadGroup(idx, true); }
+
+    private void loadGroup(int idx, boolean persist) {
         if (idx < 0 || idx >= groupNames.size()) idx = 0;
         curGroupIdx = idx;
         String g = groupNames.get(idx);
@@ -845,7 +868,7 @@ public class MainActivity extends Activity implements PlayerEngine.Listener {
         ((ChannelAdapter) channelList.getAdapter()).notifyDataSetChanged();
         channelList.setSelection(0);
         if (curChannelIdx >= curChannels.size()) curChannelIdx = -1;
-        prefs().edit().putString("lastGroup", g).apply();
+        if (persist) prefs().edit().putString("lastGroup", g).apply();
     }
 
     // ---------------- playback ----------------
@@ -1140,18 +1163,26 @@ public class MainActivity extends Activity implements PlayerEngine.Listener {
         leftPanel.setVisibility(which == PANEL_LEFT ? View.VISIBLE : View.GONE);
         rightPanel.setVisibility(which == PANEL_RIGHT ? View.VISIBLE : View.GONE);
         if (which == PANEL_LEFT) {
+            panelFocusCol = 1;
+            panelGroupPos = Math.max(0, Math.min(curGroupIdx, groupNames.size() - 1));
+            int pos = locateCurChannel();
+            if (pos < 0) pos = 0;
+            panelChanPos = Math.min(pos, Math.max(0, curChannels.size() - 1));
             ((GroupAdapter) groupList.getAdapter()).notifyDataSetChanged();
             ((ChannelAdapter) channelList.getAdapter()).notifyDataSetChanged();
             // auto-scroll to the channel currently playing
-            final int pos = locateCurChannel();
             if (pos >= 0) {
                 channelList.setSelection(pos);
+                final int fpos = pos;
                 channelList.post(new Runnable() { public void run() {
-                    channelList.setSelectionFromTop(pos, dp(80));
+                    channelList.setSelectionFromTop(fpos, dp(80));
                 }});
             }
             channelList.requestFocus();
         } else if (which == PANEL_RIGHT) {
+            rightFocusIdx = 0;
+            setRightFocus(0);
+            if (rightScroll != null) rightScroll.smoothScrollTo(0, 0);
             ChannelStore.Channel ch = curChannel();
             if (ch != null) refreshLineLabel(ch);
             refreshAspectPills();
@@ -1526,17 +1557,109 @@ public class MainActivity extends Activity implements PlayerEngine.Listener {
         }
         if (panelState == PANEL_LEFT) {
             switch (code) {
-                case KeyEvent.KEYCODE_BACK:
-                case KeyEvent.KEYCODE_DPAD_LEFT: hidePanels(); return true;
+                case KeyEvent.KEYCODE_BACK: hidePanels(); return true;
                 case KeyEvent.KEYCODE_MENU: showPanels(PANEL_RIGHT); return true;
+                case KeyEvent.KEYCODE_DPAD_LEFT:
+                    if (panelFocusCol == 1) {
+                        panelFocusCol = 0;
+                        panelGroupPos = Math.max(0, Math.min(curGroupIdx, groupNames.size() - 1));
+                        loadGroup(panelGroupPos, false);
+                        groupList.setSelection(panelGroupPos);
+                        refreshPanelFocus();
+                    } else hidePanels();
+                    return true;
+                case KeyEvent.KEYCODE_DPAD_RIGHT:
+                    if (panelFocusCol == 0) { panelFocusCol = 1; refreshPanelFocus(); }
+                    return true;
+                case KeyEvent.KEYCODE_DPAD_UP:
+                case KeyEvent.KEYCODE_CHANNEL_UP: movePanelCursor(-1); return true;
+                case KeyEvent.KEYCODE_DPAD_DOWN:
+                case KeyEvent.KEYCODE_CHANNEL_DOWN: movePanelCursor(1); return true;
+                case KeyEvent.KEYCODE_DPAD_CENTER:
+                case KeyEvent.KEYCODE_ENTER: activatePanelCursor(); return true;
             }
-            return super.dispatchKeyEvent(e);
+            return true; // 面板打开时接管全部按键，避免焦点遍历失控
         }
         // PANEL_RIGHT
         switch (code) {
             case KeyEvent.KEYCODE_BACK: hidePanels(); return true;
+            case KeyEvent.KEYCODE_MENU: return true;
+            case KeyEvent.KEYCODE_DPAD_UP: moveRightFocus(-1); return true;
+            case KeyEvent.KEYCODE_DPAD_DOWN: moveRightFocus(1); return true;
+            case KeyEvent.KEYCODE_DPAD_LEFT: actRightRow(-1); return true;
+            case KeyEvent.KEYCODE_DPAD_RIGHT:
+            case KeyEvent.KEYCODE_DPAD_CENTER:
+            case KeyEvent.KEYCODE_ENTER: actRightRow(1); return true;
         }
-        return super.dispatchKeyEvent(e);
+        return true;
+    }
+
+    // ---------------- panel cursor nav ----------------
+
+    private void movePanelCursor(int delta) {
+        if (panelFocusCol == 0) {
+            if (groupNames.isEmpty()) return;
+            panelGroupPos = Math.max(0, Math.min(groupNames.size() - 1, panelGroupPos + delta));
+            loadGroup(panelGroupPos, false); // 悬停即预览该分组频道
+            groupList.setSelection(panelGroupPos);
+        } else {
+            if (curChannels.isEmpty()) return;
+            panelChanPos = Math.max(0, Math.min(curChannels.size() - 1, panelChanPos + delta));
+            channelList.setSelection(panelChanPos);
+        }
+        refreshPanelFocus();
+    }
+
+    private void activatePanelCursor() {
+        if (panelFocusCol == 0) {
+            selectGroup(panelGroupPos);
+            panelFocusCol = 1;
+            panelChanPos = 0;
+            channelList.setSelection(0);
+            refreshPanelFocus();
+        } else {
+            playChannelAt(panelChanPos);
+        }
+    }
+
+    private void refreshPanelFocus() {
+        ((GroupAdapter) groupList.getAdapter()).notifyDataSetChanged();
+        ((ChannelAdapter) channelList.getAdapter()).notifyDataSetChanged();
+    }
+
+    private void moveRightFocus(int delta) {
+        if (rightRows.isEmpty()) return;
+        setRightFocus(-1);
+        rightFocusIdx = Math.max(0, Math.min(rightRows.size() - 1, rightFocusIdx + delta));
+        setRightFocus(rightFocusIdx);
+        View v = rightRows.get(rightFocusIdx);
+        if (rightScroll != null) rightScroll.smoothScrollTo(0, Math.max(0, v.getTop() - dp(60)));
+    }
+
+    private void setRightFocus(int idx) {
+        for (int i = 0; i < rightRows.size(); i++) {
+            rightRows.get(i).setBackgroundColor(i == idx ? 0x30FFFFFF : Color.TRANSPARENT);
+        }
+    }
+
+    private void actRightRow(int dir) {
+        if (rightRows.isEmpty() || rightFocusIdx < 0 || rightFocusIdx >= rightRows.size()) return;
+        String mode = rightRowModes.get(rightFocusIdx);
+        if (mode.length() == 0) {
+            if (dir > 0) rightRows.get(rightFocusIdx).performClick(); // OK 触发按钮
+            return;
+        }
+        if ("dec".equals(mode)) switchDecode(dir);
+        else if ("autoline".equals(mode)) toggleAutoLine();
+        else if ("line".equals(mode)) switchLine(dir);
+        else if ("aspect".equals(mode)) stepAspect(dir);
+    }
+
+    private void stepAspect(int delta) {
+        int next = ((engine.getAspect() + delta) % 5 + 5) % 5;
+        engine.setAspect(next);
+        prefs().edit().putInt("aspect", next).apply();
+        refreshAspectPills();
     }
 
     // ---------------- adapters ----------------
@@ -1555,10 +1678,15 @@ public class MainActivity extends Activity implements PlayerEngine.Listener {
             }
             String g = groupNames.get(pos);
             tv.setText(g);
+            boolean focus = panelFocusCol == 0 && pos == panelGroupPos;
             boolean cur = pos == curGroupIdx;
-            if (cur) {
+            if (focus) {
                 tv.setBackground(roundBg(COL_RED, 4));
                 tv.setTextColor(Color.WHITE);
+                tv.setTypeface(null, android.graphics.Typeface.BOLD);
+            } else if (cur) {
+                tv.setBackground(roundBg(0x30FF6B6B, 4));
+                tv.setTextColor(0xFFFF9B9B);
                 tv.setTypeface(null, android.graphics.Typeface.BOLD);
             } else {
                 tv.setBackground(new android.graphics.drawable.ColorDrawable(0));
@@ -1664,7 +1792,8 @@ public class MainActivity extends Activity implements PlayerEngine.Listener {
                 prog.setVisibility(View.GONE);
                 if (panelState == PANEL_LEFT) requestEpgNow(ch);
             }
-            cell.setBackgroundColor(cur ? 0x14FFFFFF : 0x00000000);
+            boolean focus = panelFocusCol == 1 && pos == panelChanPos;
+            cell.setBackgroundColor(focus ? 0x38FF6B6B : cur ? 0x14FFFFFF : 0x00000000);
             return cell;
         }
     }
