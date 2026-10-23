@@ -85,6 +85,12 @@ public class MainActivity extends Activity implements PlayerEngine.Listener {
     private ArrayList<String> curLines = new ArrayList<String>();
     private ArrayList<String> curLineLabels = new ArrayList<String>();
 
+    // 弹窗手动焦点（真机遥控器：不依赖系统焦点遍历）
+    private android.app.Dialog curDialog;
+    private final java.util.ArrayList<View> dlgFocusables = new java.util.ArrayList<View>();
+    private int dlgFocusIdx = 0;
+    private Runnable dlgOnBack;
+
     private ChannelStore.Channel curPlayCh; // currently playing channel (independent of list index)
     private int panelState = PANEL_NONE;
     private long lastBackAt;
@@ -202,6 +208,7 @@ public class MainActivity extends Activity implements PlayerEngine.Listener {
             String posText, final Runnable posAction,
             String negText, final Runnable negAction,
             String neutralText, final Runnable neutralAction) {
+        lastDialogBody = body;
         final android.app.Dialog dlg = new android.app.Dialog(this);
         dlg.requestWindowFeature(Window.FEATURE_NO_TITLE);
         dlg.getWindow().setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(Color.TRANSPARENT));
@@ -262,10 +269,94 @@ public class MainActivity extends Activity implements PlayerEngine.Listener {
         int w = Math.min(getResources().getDisplayMetrics().widthPixels - dp(32), dp(420));
         rootF.addView(card, new FrameLayout.LayoutParams(w, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
         dlg.setContentView(rootF);
+
+        // 手动光标：弹窗打开时收集可聚焦子视图，遥控器方向键/OK 自行导航（不依赖系统焦点）
+        dlg.setOnShowListener(new DialogInterface.OnShowListener() {
+            public void onShow(DialogInterface d) { initDialogFocus(dlg); }
+        });
+        dlg.setOnDismissListener(new DialogInterface.OnDismissListener() {
+            public void onDismiss(DialogInterface d) { clearDialogFocus(dlg); }
+        });
         return dlg;
     }
 
-    /** dialog pill button: primary = red filled; focus state brightens (TV remote) */
+    private View lastDialogBody;
+
+    /** 收集弹窗里所有可聚焦视图（按钮+行），并把当前弹窗登记为活动弹窗 */
+    private void initDialogFocus(android.app.Dialog dlg) {
+        curDialog = dlg;
+        dlgOnBack = null;
+        dlgFocusables.clear();
+        View content = dlg.getWindow() != null ? dlg.getWindow().getDecorView() : null;
+        if (content != null) collectFocusables(content);
+        // 默认焦点放在主按钮（最后一个 primary 按钮），否则第一个
+        dlgFocusIdx = dlgFocusables.size() - 1;
+        if (dlgFocusIdx < 0) dlgFocusIdx = 0;
+        // 有 body 行但没有按钮时，焦点给第一行
+        refreshDialogFocus();
+    }
+
+    private void collectFocusables(View v) {
+        if (v instanceof TextView && v.isFocusable() && !(v instanceof EditText)) {
+            dlgFocusables.add(v);
+            return;
+        }
+        if (v instanceof ViewGroup) {
+            ViewGroup g = (ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) collectFocusables(g.getChildAt(i));
+        }
+    }
+
+    private void clearDialogFocus(android.app.Dialog dlg) {
+        if (curDialog == dlg) {
+            curDialog = null;
+            dlgOnBack = null;
+            dlgFocusables.clear();
+            dlgFocusIdx = 0;
+        }
+    }
+
+    // 每个可聚焦视图记录自己是「按钮(button)」还是「行(row)」，高亮还原方式不同
+    private final java.util.HashSet<View> dlgButtons = new java.util.HashSet<View>();
+
+    private void refreshDialogFocus() {
+        for (int i = 0; i < dlgFocusables.size(); i++) {
+            View v = dlgFocusables.get(i);
+            boolean has = i == dlgFocusIdx;
+            if (dlgButtons.contains(v)) {
+                boolean primary = v.getTag() instanceof Boolean && (Boolean) v.getTag();
+                if (has) v.setBackground(roundBg(primary ? 0xFFFF6B6B : 0x42FFFFFF, 19));
+                else v.setBackground(roundBg(primary ? COL_RED : COL_PILL, 19));
+            } else {
+                boolean act = v.getTag() instanceof Boolean && (Boolean) v.getTag();
+                v.setBackground(roundBg(has ? 0x50FFFFFF : (act ? 0x1AF03E3E : 0x00000000), 8));
+            }
+        }
+    }
+
+    private void moveDialogFocus(int delta) {
+        if (dlgFocusables.isEmpty()) return;
+        dlgFocusIdx = Math.max(0, Math.min(dlgFocusables.size() - 1, dlgFocusIdx + delta));
+        refreshDialogFocus();
+        // 滚到可见
+        View v = dlgFocusables.get(dlgFocusIdx);
+        View p = (View) v.getParent();
+        while (p != null && !(p instanceof ScrollView)) p = (View) p.getParent();
+        if (p instanceof ScrollView) {
+            final ScrollView sc = (ScrollView) p;
+            final View fv = v;
+            sc.post(new Runnable() { public void run() {
+                sc.smoothScrollTo(0, Math.max(0, fv.getTop() - dp(30)));
+            }});
+        }
+    }
+
+    private void activateDialogFocus() {
+        if (dlgFocusables.isEmpty() || dlgFocusIdx < 0 || dlgFocusIdx >= dlgFocusables.size()) return;
+        dlgFocusables.get(dlgFocusIdx).performClick();
+    }
+
+    /** dialog pill button: primary = red filled; highlight driven by manual cursor (TV remote) */
     private TextView dlgBtn(String text, final boolean primary, final android.app.Dialog dlg, final Runnable action) {
         final TextView b = new TextView(this);
         b.setText(text);
@@ -275,42 +366,28 @@ public class MainActivity extends Activity implements PlayerEngine.Listener {
         b.setFocusableInTouchMode(true);
         b.setBackground(roundBg(primary ? COL_RED : COL_PILL, 19));
         b.setTextColor(primary ? Color.WHITE : COL_TXT);
-        b.setOnFocusChangeListener(new View.OnFocusChangeListener() {
-            public void onFocusChange(View v, boolean has) {
-                if (has) {
-                    b.setBackground(roundBg(primary ? 0xFFFF6B6B : 0x42FFFFFF, 19));
-                    b.setTextColor(Color.WHITE);
-                } else {
-                    b.setBackground(roundBg(primary ? COL_RED : COL_PILL, 19));
-                    b.setTextColor(primary ? Color.WHITE : COL_TXT);
-                }
-            }
-        });
+        b.setTag(primary ? Boolean.TRUE : Boolean.FALSE);
         b.setOnClickListener(new View.OnClickListener() {
             public void onClick(View v) {
                 dlg.dismiss();
                 if (action != null) action.run();
             }
         });
+        dlgButtons.add(b);
         return b;
     }
 
-    /** clickable list row inside a dialog (line switcher, DLNA devices) */
+    /** clickable list row inside a dialog (line switcher, DLNA devices); highlight driven by manual cursor */
     private TextView dlgRow(String text, boolean active) {
         final TextView r = new TextView(this);
         r.setText(text);
         r.setTextSize(15);
         r.setTextColor(active ? COL_RED : COL_TXT);
-        r.setFocusable(true);
-        r.setFocusableInTouchMode(true);
         r.setBackground(roundBg(active ? 0x1AF03E3E : 0x00000000, 8));
         r.setPadding(dp(10), dp(9), dp(10), dp(9));
-        r.setOnFocusChangeListener(new View.OnFocusChangeListener() {
-            public void onFocusChange(View v, boolean has) {
-                boolean act = r.getText().toString().contains("（当前）") || r.getText().toString().startsWith("▶");
-                r.setBackground(roundBg(has ? 0x2AFFFFFF : (act ? 0x1AF03E3E : 0x00000000), 8));
-            }
-        });
+        r.setFocusable(true);
+        r.setFocusableInTouchMode(true);
+        r.setTag(active ? Boolean.TRUE : Boolean.FALSE);
         return r;
     }
 
@@ -1280,6 +1357,14 @@ public class MainActivity extends Activity implements PlayerEngine.Listener {
                         }
                     });
                     box.addView(b);
+                    // 新设备行加入后重新收集焦点（异步动态增行）
+                    if (curDialog == dlg) {
+                        dlgFocusables.clear();
+                        View dec = dlg.getWindow() != null ? dlg.getWindow().getDecorView() : null;
+                        if (dec != null) collectFocusables(dec);
+                        dlgFocusIdx = Math.min(dlgFocusIdx, Math.max(0, dlgFocusables.size() - 1));
+                        refreshDialogFocus();
+                    }
                 }});
             }
             public void onDone(int count) {
@@ -1534,6 +1619,27 @@ public class MainActivity extends Activity implements PlayerEngine.Listener {
     public boolean dispatchKeyEvent(KeyEvent e) {
         if (e.getAction() != KeyEvent.ACTION_DOWN) return super.dispatchKeyEvent(e);
         int code = e.getKeyCode();
+        // 弹窗打开时优先处理弹窗焦点导航
+        if (curDialog != null && curDialog.isShowing()) {
+            switch (code) {
+                case KeyEvent.KEYCODE_BACK:
+                    curDialog.dismiss();
+                    return true;
+                case KeyEvent.KEYCODE_DPAD_UP:
+                    moveDialogFocus(-1);
+                    return true;
+                case KeyEvent.KEYCODE_DPAD_DOWN:
+                    moveDialogFocus(1);
+                    return true;
+                case KeyEvent.KEYCODE_DPAD_LEFT:
+                case KeyEvent.KEYCODE_DPAD_RIGHT:
+                case KeyEvent.KEYCODE_DPAD_CENTER:
+                case KeyEvent.KEYCODE_ENTER:
+                    activateDialogFocus();
+                    return true;
+            }
+            return true; // 弹窗打开时吞掉其余按键
+        }
         if (panelState == PANEL_NONE) {
             switch (code) {
                 case KeyEvent.KEYCODE_DPAD_UP:
