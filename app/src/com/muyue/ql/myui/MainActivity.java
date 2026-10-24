@@ -141,6 +141,16 @@ public class MainActivity extends Activity implements PlayerEngine.Listener {
     protected void onPause() {
         super.onPause();
         saveState();
+        // 切后台立即停声，避免后台仍有直播声音
+        engine.pausePlayback();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        // 回前台恢复播放
+        engine.resumePlayback();
+        hideSystemUi();
     }
 
     // ---------------- ui helpers ----------------

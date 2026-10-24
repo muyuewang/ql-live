@@ -351,8 +351,34 @@ public class PlayerEngine {
         }
     }
 
+    private boolean pausedByLifecycle;
+    private float savedVolume = 1f;
+
+    /** 切后台/失去焦点时静音 + 暂停（HLS 直播流 pause 可能停不住音轨，静音双保险） */
+    public void pausePlayback() {
+        if (player == null || pausedByLifecycle) return;
+        try {
+            player.setVolume(0f, 0f); // 先静音，杜绝后台出声
+            player.pause();
+            pausedByLifecycle = true;
+        } catch (Throwable ignored) {}
+    }
+
+    /** 回前台时恢复音量并继续播放 */
+    public void resumePlayback() {
+        if (player == null || !pausedByLifecycle) return;
+        try {
+            player.setVolume(savedVolume, savedVolume);
+            player.start();
+            pausedByLifecycle = false;
+        } catch (Throwable ignored) {}
+    }
+
+    public boolean isPaused() { return pausedByLifecycle; }
+
     public void stopAll() {
         stopped = true;
+        pausedByLifecycle = false;
         main.removeCallbacks(timeout);
         main.removeCallbacks(bufferWatchdog);
         bufferingSince = 0;
