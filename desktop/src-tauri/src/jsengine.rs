@@ -43,7 +43,8 @@ pub trait HostBridge: Send + Sync {
         false
     }
     /// 实际的同步调用
-    fn call(&self, name: &str, a: &str, b: &str, c: &str) -> String {
+    fn call(&self, name: &str, a: &str, b: &str, c: &str, d: &str) -> String {
+        let _ = (a, b, c, d);
         String::new()
     }
 }
@@ -69,19 +70,21 @@ if (typeof console.warn !== 'function') { console.warn = function(){}; }
 
 var client = {};
 (function () {
+    // 官方引擎 JS 实际调用到的全部原生方法（等价安卓 ParserJsInterface）。
     var names = [
         'getPkgName', 'getAppVersion', 'getNwtime', 'getMD5', 'getMac',
         'getImei', 'getUserToken', 'getTmKey', 'getLocation', 'writeFile',
         'getUrlContent', 'getUrlContentWithHeader', 'getPostContent',
         'getPostContent1', 'getPostRespAndHeaders', 'getRespAndHeaders',
-        'AESDecrypt128', 'encC20Ep'
+        'AESDecrypt128', 'encC20Ep', 'getJxtvKey', 'getBstFk',
+        'getCntvUrl', 'getHncscsKey', 'getUtid'
     ];
     function str(v) { return (v === undefined || v === null) ? '' : String(v); }
     for (var i = 0; i < names.length; i++) {
         (function (nm) {
-            if (__native('__has', nm, '', '') !== '1') { return; }
-            client[nm] = function (a, b, c) {
-                return __native(nm, str(a), str(b), str(c));
+            if (__native('__has', nm, '', '', '') !== '1') { return; }
+            client[nm] = function (a, b, c, d) {
+                return __native(nm, str(a), str(b), str(c), str(d));
             };
         })(names[i]);
     }
@@ -281,11 +284,11 @@ impl JsEngine {
             let b = bridge.clone();
             let native_fn = Function::new(
                 ctx.clone(),
-                move |name: String, a: String, b2: String, c: String| -> String {
+                move |name: String, a: String, b2: String, c: String, d: String| -> String {
                     if name == "__has" {
                         return if b.supports(&a) { "1".into() } else { "0".into() };
                     }
-                    b.call(&name, &a, &b2, &c)
+                    b.call(&name, &a, &b2, &c, &d)
                 },
             )
             .map_err(|e| format!("注册桥接失败: {e}"))?;

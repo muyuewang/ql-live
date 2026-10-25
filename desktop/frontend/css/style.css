@@ -317,6 +317,7 @@ svg { display: block; }
   padding: 34px 12px;
   font-size: 13px;
 }
+.empty-hint { font-size: 12px; opacity: 0.72; }
 
 /* ================= 播放区 ================= */
 #playerPanel {

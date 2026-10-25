@@ -25,6 +25,9 @@ pub struct PlayLine {
     pub kind: String,
     /// 请求该 url 时需附加的 Referer（htmlplay/部分线路需要），空串表示无需
     pub referer: String,
+    /// 探测确认该地址是 HLS 清单。前端据此决定走 hls.js 而不是原生 video.src
+    /// （有些源地址不带 .m3u8 后缀，靠后缀猜会走错分支、黑等好几秒再换线）。
+    pub hls: bool,
 }
 
 fn now_sec() -> u64 {
@@ -41,7 +44,7 @@ pub const APPLE_UA: &str =
     "AppleCoreMedia/1.0.0.l6F79 (iPhone; U; CPU OS 11_6 like Mac OS X; zh_cn)";
 
 /// 构造带签名的公共参数串（不含开头 ? 或 &）
-fn signed_params() -> String {
+pub fn signed_params() -> String {
     let tm = now_sec();
     let key = sign_key(tm);
     format!(
@@ -50,19 +53,34 @@ fn signed_params() -> String {
     )
 }
 
-fn build_reqwest() -> reqwest::blocking::Client {
-    reqwest::blocking::Client::builder()
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36")
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .expect("build client")
+/// 桌面端通用 UA（接口站点认这个）。
+const UA_PC: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36";
+
+/// 进程级共享 HTTP 客户端。
+///
+/// 以前每个请求都新建一个 Client：连接池、TLS 会话缓存全丢，光握手就要
+/// 白付几十到几百毫秒。线路探测是切台链路里最重的一步，这块必须复用。
+fn client() -> &'static reqwest::blocking::Client {
+    static C: std::sync::OnceLock<reqwest::blocking::Client> = std::sync::OnceLock::new();
+    C.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .connect_timeout(std::time::Duration::from_secs(8))
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .tcp_keepalive(std::time::Duration::from_secs(60))
+            .build()
+            .expect("build client")
+    })
 }
 
 /// 分组列表（明文 JSON 数组）
 pub fn fetch_provs() -> Result<Vec<String>, String> {
-    let client = build_reqwest();
     let url = format!("{}/api/get_prov.php", HOST);
-    let body = client.get(&url).send().map_err(|e| e.to_string())?;
+    let body = client()
+        .get(&url)
+        .header("User-Agent", UA_PC)
+        .send()
+        .map_err(|e| e.to_string())?;
     let text = body.text().map_err(|e| e.to_string())?;
     let arr: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
     let mut out = Vec::new();
@@ -85,10 +103,13 @@ pub fn fetch_provs() -> Result<Vec<String>, String> {
 
 /// 频道列表（带签名，响应可能是明文 JSON 数组，或 AES 加密）
 pub fn fetch_group(prov: &str) -> Result<Vec<Channel>, String> {
-    let client = build_reqwest();
     let encoded = urlencoding::encode(prov);
     let url = format!("{}/api/get_channel.php?id={}&{}", HOST, encoded, signed_params());
-    let body = client.get(&url).send().map_err(|e| e.to_string())?;
+    let body = client()
+        .get(&url)
+        .header("User-Agent", UA_PC)
+        .send()
+        .map_err(|e| e.to_string())?;
     let text = body.text().map_err(|e| e.to_string())?;
     let trimmed = text.trim();
     let plain = if trimmed.starts_with('[') {
@@ -121,14 +142,17 @@ pub fn fetch_group(prov: &str) -> Result<Vec<Channel>, String> {
 
 /// 频道取源：返回 kdsvod:// 等线路
 pub fn fetch_source(ename: &str) -> Result<Vec<PlayLine>, String> {
-    let client = build_reqwest();
     let url = format!(
         "{}/api/get_source2024.php?ename={}&{}",
         HOST,
         urlencoding::encode(ename),
         signed_params()
     );
-    let body = client.get(&url).send().map_err(|e| e.to_string())?;
+    let body = client()
+        .get(&url)
+        .header("User-Agent", UA_PC)
+        .send()
+        .map_err(|e| e.to_string())?;
     let text = body.text().map_err(|e| e.to_string())?;
     let trimmed = text.trim();
 
@@ -174,6 +198,7 @@ pub fn fetch_source(ename: &str) -> Result<Vec<PlayLine>, String> {
             playable: false,
             kind: raw_kind,
             referer: String::new(),
+            hls: false,
         });
     }
     Ok(out)
@@ -282,8 +307,7 @@ pub fn resolve_htmlplay(line: &str) -> Result<(String, String), String> {
         return Err("htmlplay 地址无效".into());
     }
 
-    let client = build_reqwest();
-    let resp = client
+    let resp = client()
         .get(&u)
         .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
         .send()
@@ -386,23 +410,38 @@ pub fn resolve_kdsvod_sign(line: &str) -> Result<String, String> {
 ///
 /// 判断标准：响应的有效载荷（非 BOM/空白）以 `#EXTM3U` 开头才视为可播；其余一律不可播。
 /// 只下载响应体开头 1KB 以内即中断判断，超时 5s，避免拖慢 get_lines。
-pub fn probe_playable(url: &str) -> bool {
+/// 单条线路的探测结论。
+pub struct Probe {
+    pub playable: bool,
+    /// 是不是 HLS 清单（探测时按 #EXTM3U 判定，前端据此选 hls.js）
+    pub hls: bool,
+    /// 跟随 302 之后的最终地址。交给前端直接用，能省掉一次跳转往返
+    /// （这些源一跳就要 500ms 上下，很值）。
+    pub final_url: String,
+}
+
+/// 模拟播放器取一次清单：能播返回结论；不可播 `playable=false`。
+pub fn probe(url: &str) -> Probe {
     use std::io::Read;
-    let client = match reqwest::blocking::Client::builder()
-        .user_agent(APPLE_UA)
+    let mut p = Probe {
+        playable: false,
+        hls: false,
+        final_url: String::new(),
+    };
+    let mut resp = match client()
+        .get(url)
+        .header("User-Agent", APPLE_UA)
         .timeout(std::time::Duration::from_secs(5))
-        .build()
+        .send()
     {
-        Ok(c) => c,
-        Err(_) => return true, // 无法建客户端时不做过滤，交由前端兜底
-    };
-    let mut resp = match client.get(url).send() {
         Ok(r) => r,
-        Err(_) => return false, // 网络/404/403 等请求失败 → 不可播
+        Err(_) => return p, // 网络/超时/404/403 等请求失败 → 不可播
     };
+    // 记下重定向后的落点（reqwest 默认已跟到最终地址）
+    p.final_url = resp.url().to_string();
     // 404/403 等非 2xx 直接判不可播（reqwest send 成功但 status 非 2xx）
     if !resp.status().is_success() {
-        return false;
+        return p;
     }
     // 读响应体开头，只取前 1KB，见到非 #EXTM3U 即判废
     let mut buf = [0u8; 64];
@@ -432,15 +471,21 @@ pub fn probe_playable(url: &str) -> bool {
                 let prefix = head.trim_start_matches(|c: char| c == '\u{feff}' || c.is_whitespace());
                 if saw_content && !prefix.is_empty() {
                     // 一旦读到首个有效片段即可判断（只需知道是否 #EXTM3U 开头）
-                    return prefix.starts_with("#EXTM3U");
+                    p.playable = prefix.starts_with("#EXTM3U");
+                    p.hls = p.playable;
+                    return p;
                 }
                 if total > 1024 {
                     break;
                 }
             }
-            Err(_) => return false,
+            Err(_) => return p,
         }
     }
     // 空响应体 → 不可播
-    false
+    p
+}
+
+pub fn probe_playable(url: &str) -> bool {
+    probe(url).playable
 }
