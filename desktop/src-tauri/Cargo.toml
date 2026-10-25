@@ -21,6 +21,9 @@ cbc = { version = "0.1", features = ["alloc"] }
 urlencoding = "2"
 rand = "0.8"
 chrono = "0.4"
+# 引擎算法 JS 热更新：下载 js.zip 需要解压，执行需要内嵌 JS 引擎
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+rquickjs = { version = "0.14", features = ["array-buffer", "classes"] }
 
 [profile.release]
 panic = "abort"

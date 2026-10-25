@@ -50,16 +50,20 @@ pub fn default_salt() -> String {
 }
 
 /// kdsvod://...pwd=jsdecode 线路的 sign 生成（等价于引擎 other_live.js 的 addSign）。
-/// 已逆向自 encrypt_other_live.js（RSA 混淆解密后明文，d=343/n=12382 模幂还原）：
+/// 已逆向自 encrypt_other_live.js（RSA 混淆解密后明文）：
 ///
 ///   id      = URL 中 `?id=` 与 `&` 之间
 ///   app     = 包名（原版 com.jiaoxiang.fangnale；本重构包 com.muyue.ql）
 ///   version = 版本号
-///   mac     = "l1:1l:l1:1l:l1:1l"（固定）
-///   nwtime  = 服务器/当前秒级时间戳
-///   ev      = "20250805"（固定）
-///   srcKey  = id + app + "ahkajfkahlajjaflfakhfakfbuyaozaigaolefuquqikangbuzhu" + version + mac + nwtime + ev
+///   mac     = MAC_MAC（固定，随引擎版本轮换）
+///   nwtime  = 当前秒级时间戳
+///   ev      = EV_EV（固定，随引擎版本轮换）
+///   srcKey  = id + app + KEY_SALT + version + mac + nwtime + ev
 ///   sign    = md5(srcKey)
+///
+/// 常量来源：线上 js.zip（js-20241115.zip）解出的 addSign 明文。
+/// 服务端对 sign 确有校验（错误 sign 返回 `sign error`），但对历史 ev/mac 保留兼容，
+/// 所以换版本后旧值仍可用一段时间——这也是不能只靠硬编码的原因。
 pub fn add_sign(
     id: &str,
     app: &str,
@@ -73,19 +77,25 @@ pub fn add_sign(
     format!("{:x}", md5::compute(src_key.as_bytes()))
 }
 
+/// addSign 里写死的 mac 值（当前线上版本 fu:ck:92:92:ff；旧版 l1:1l:l1:1l:l1:1l）
+pub const ADD_SIGN_MAC: &str = "fu:ck:92:92:ff";
+/// addSign 里写死的 ev 值（当前线上版本 20240918；旧版 20250805）
+pub const ADD_SIGN_EV: &str = "20240918";
+/// 客户端上报版本号（等价 getAppVersion()）
+pub const ADD_SIGN_VERSION: &str = "2.3.9";
+/// 本重构包名（等价 getPkgName()）
+pub const APP_PKG: &str = "com.muyue.ql";
+
 /// kdsvod 线路 host 替换规则（等价 native_layer.js 的 getHost）。
-/// 包名未命中白名单 => 默认 121.199.48.54（hz05）。
+/// 新版引擎已改为按包名映射域名，未命中一律走默认域名 vds.91kds.cn。
 pub fn kds_host(app: &str) -> &'static str {
-    const HZ05: &[&str] = &["com.zbdq.tvhd", "com.zbdq2025.tvhd", "com.dsdq2025.tvhd",
-        "cc.zztv.tvbox", "com.zstv.tvhd", "cc.yxtv.tvhd"];
-    const HZ07: &[&str] = &["com.chenfengtv.tvbox", "com.cjitv.tvhd", "cc.yftv.tvhd",
-        "com.fftv.tvbox", "com.lktv.tvhd", "cc.yunshangtv.tvhd"];
-    if HZ05.contains(&app) {
-        "47.96.12.149"
-    } else if HZ07.contains(&app) {
-        "47.111.31.246"
-    } else {
-        "121.199.48.54"
+    match app {
+        "com.kaixinhd.player" | "com.dsdqjx.tvhd" => "hd1.91kds.cn",
+        "net.coolcan.tvlivehd" => "tvlive.youtu8.cn",
+        "org.jykds.player" => "kds888.91kds.cn",
+        "org.jykds.tvlive" => "ktv888.91kds.cn",
+        "com.jiaoxiang.fangnale" => "kgq888.91kds.cn",
+        _ => "vds.91kds.cn",
     }
 }
 
@@ -102,14 +112,16 @@ mod tests {
     #[test]
     fn test_add_sign_basic() {
         // 仅验证确定性：同一输入产出同一 sign，且为 32 位 hex。
-        let s = add_sign("12345", "com.muyue.ql", "2.3.9", "l1:1l:l1:1l:l1:1l", 1730000000, "20250805");
+        let s = add_sign("12345", APP_PKG, ADD_SIGN_VERSION, ADD_SIGN_MAC, 1730000000, ADD_SIGN_EV);
         assert_eq!(s.len(), 32);
         assert!(s.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
     fn test_kds_host_default() {
-        assert_eq!(kds_host("com.muyue.ql"), "121.199.48.54");
-        assert_eq!(kds_host("com.zbdq.tvhd"), "47.96.12.149");
+        // 新版引擎把主机表改成域名，未命中包名一律默认域名
+        assert_eq!(kds_host("com.muyue.ql"), "vds.91kds.cn");
+        assert_eq!(kds_host("com.jiaoxiang.fangnale"), "kgq888.91kds.cn");
+        assert_eq!(kds_host("org.jykds.tvlive"), "ktv888.91kds.cn");
     }
 }

@@ -1,7 +1,10 @@
 use serde::Serialize;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::crypto::{add_sign, aes_cbc_decrypt, default_salt, kds_host, sign_key, HOST};
+use crate::crypto::{
+    add_sign, aes_cbc_decrypt, default_salt, kds_host, sign_key, ADD_SIGN_EV, ADD_SIGN_MAC,
+    ADD_SIGN_VERSION, APP_PKG, HOST,
+};
 
 /// 一个频道
 #[derive(Serialize, Clone, Debug)]
@@ -322,15 +325,15 @@ fn host_of(u: &str) -> Option<String> {
 }
 
 /// 对 kdsvod://...pwd=jsdecode 线路做 sign 二次解析，产出可直接播放的最终 m3u8 地址。
-/// 等价于引擎 other_live.js 的 kdsLiveParsePlay + addSign（已完整逆向、实测复现）：
+/// 等价于引擎 other_live.js 的 kdsLiveParsePlay + addSign：
 ///
 ///   1. 提取 ?id= 与 & 之间的 id
-///   2. host = kds_host(app)（包名白名单 -> hz05/hz07/hz08），替换 v.91kds.com/b7|c7、utuxx.91kds.cn/live1|2
+///   2. lurl 去掉 &pwd=jsdecode，仅替换 v.91kds.com/b7|c7 → getHost()/live1|2
+///      （**不要**动 utuxx.91kds.cn —— 引擎只替换 v.91kds.com，多替换会把可用线路改死）
 ///   3. sign = add_sign(id, app, version, mac, nwtime, ev)（md5 拼接，见 crypto.rs）
 ///   4. 拼接 &app=&version=&mac=&nwtime=&sign=&ev=
-///   5. 尾部追加 @@User-Agent=AppleCoreMedia/...@@ 附加头
 ///
-/// app 默认取重构包名 com.muyue.ql；version 默认 2.3.9；ev 固定 "20250805"。
+/// 常量统一在 crypto.rs（ADD_SIGN_MAC / ADD_SIGN_EV / APP_PKG / ADD_SIGN_VERSION）。
 pub fn resolve_kdsvod_sign(line: &str) -> Result<String, String> {
     // 剥离 kdsvod:// 前缀
     let inner = line
@@ -352,21 +355,19 @@ pub fn resolve_kdsvod_sign(line: &str) -> Result<String, String> {
         return Err("id 为空".into());
     }
 
-    let app = "com.muyue.ql";
-    let version = "2.3.9";
-    let mac = "l1:1l:l1:1l:l1:1l";
+    let app = APP_PKG;
+    let version = ADD_SIGN_VERSION;
+    let mac = ADD_SIGN_MAC;
     let nwtime = now_sec();
-    let ev = "20250805";
+    let ev = ADD_SIGN_EV;
 
-    // 去掉 pwd=jsdecode，做 host 替换
+    // 去掉 pwd=jsdecode，做 host 替换（与引擎严格一致）
     let mut lurl = inner.replace("&pwd=jsdecode", "");
     let host = kds_host(app);
     lurl = lurl.replace("v.91kds.com/b7", &format!("{}/live1", host));
     lurl = lurl.replace("v.91kds.com/c7", &format!("{}/live2", host));
-    lurl = lurl.replace("utuxx.91kds.cn/live1", &format!("{}/live1", host));
-    lurl = lurl.replace("utuxx.91kds.cn/live2", &format!("{}/live2", host));
 
-    let sign = add_sign(&id, app, version, mac, nwtime, ev);
+    let sign = add_sign(id.as_str(), app, version, mac, nwtime, ev);
     let play_url = format!(
         "{}&app={}&version={}&mac={}&nwtime={}&sign={}&ev={}",
         lurl, app, version, mac, nwtime, sign, ev
