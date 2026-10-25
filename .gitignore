@@ -11,3 +11,8 @@ unknown/
 keystore*
 *.log
 .DS_Store
+
+# Desktop (Tauri/Rust) build artifacts
+/desktop/src-tauri/target/
+/desktop/frontend/node_modules/
+/desktop/dist/

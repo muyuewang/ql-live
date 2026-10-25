@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build youtu myui APK: compile -> dex -> apktool b -> inject dex+asset -> sign
 set -e
-cd /c/Users/fengxin/youtu_work/myapp
+cd /c/Users/fengxin/youtu_work/android
 J=/d/devtool/jdk-21.0.4/bin
 echo "== javac stubs =="
 rm -rf out_stub && mkdir out_stub
@@ -32,7 +32,7 @@ with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as zo:
         zo.writestr(zipfile.ZipInfo(info.filename, (2026, 10, 16, 0, 0, 0)), zin.read(info.filename))
     zi = zipfile.ZipInfo('classes7.dex', (2026, 10, 16, 0, 0, 0))
     zi.external_attr = 0o644 << 16
-    zo.writestr(zi, open('myapp/classes7.dex', 'rb').read())
+    zo.writestr(zi, open('android/classes7.dex', 'rb').read())
 print('inject ok')
 EOF
 echo "== sign =="
