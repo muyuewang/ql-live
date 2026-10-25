@@ -209,6 +209,45 @@ where
     })
 }
 
+/// 记录远端 js.zip 的版本标记（用 ETag/Content-Length 拼的指纹）。
+pub fn read_tag(dir: &Path) -> Option<String> {
+    std::fs::read_to_string(dir.join(".js_zip_tag"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// 写入版本标记；失败不影响主流程。
+pub fn write_tag(dir: &Path, tag: &str) {
+    let _ = std::fs::create_dir_all(dir);
+    let _ = std::fs::write(dir.join(".js_zip_tag"), tag.trim());
+}
+
+/// 本地引擎包超过这么多秒就强制刷新一次。
+///
+/// js.zip 的 CDN 只给 `Content-Length` 不给 ETag，所以「长度没变 = 没更新」这个
+/// 判断会漏掉等长替换。加一个时间兜底，最坏情况延迟一个周期拿到新版。
+const REFRESH_AFTER_SECS: u64 = 3 * 24 * 3600;
+
+fn bundle_age_secs(dir: &Path) -> Option<u64> {
+    let meta = std::fs::metadata(dir.join("encrypt_root.js")).ok()?;
+    let mtime = meta.modified().ok()?;
+    mtime.elapsed().ok().map(|d| d.as_secs())
+}
+
+/// 远端标记与本地不一致（或本地没有标记）时说明引擎包可能更新过。
+pub fn needs_refresh(dir: &Path, remote_tag: Option<&str>) -> bool {
+    if matches!(bundle_age_secs(dir), Some(age) if age > REFRESH_AFTER_SECS) {
+        return true;
+    }
+    match (remote_tag, read_tag(dir)) {
+        (Some(remote), Some(local)) => remote != local,
+        (Some(_), None) => true,
+        // 拿不到远端标记时不要盲目重下，沿用本地缓存
+        (None, _) => false,
+    }
+}
+
 /// 内嵌引擎实例。
 ///
 /// 注意字段顺序：`Context` 必须先于 `Runtime` 声明，保证析构顺序正确。

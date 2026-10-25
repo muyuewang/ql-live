@@ -16,7 +16,12 @@ use source::{
     resolve_playable, Channel, PlayLine,
 };
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+/// 本次运行内引擎包已确认不可用（下载失败/校验失败）。
+/// 避免每点一个频道都重试一次下载，把界面卡上十几秒。
+static ENGINE_OFFLINE: AtomicBool = AtomicBool::new(false);
 
 /// 引擎 JS 的落地目录（与安装目录解耦，避免 Program Files 只读问题）。
 fn engine_dir() -> PathBuf {
@@ -29,7 +34,7 @@ fn engine_dir() -> PathBuf {
 fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
     let client = reqwest::blocking::Client::builder()
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36")
-        .timeout(Duration::from_secs(25))
+        .timeout(Duration::from_secs(15))
         .build()
         .map_err(|e| e.to_string())?;
     let resp = client.get(url).send().map_err(|e| e.to_string())?;
@@ -39,18 +44,61 @@ fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
     resp.bytes().map(|b| b.to_vec()).map_err(|e| e.to_string())
 }
 
+/// 取远端 js.zip 的版本指纹（ETag + 长度）。拿不到返回 None，不影响主流程。
+fn remote_js_tag(url: &str) -> Option<String> {
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36")
+        .timeout(Duration::from_secs(8))
+        .build()
+        .ok()?;
+    let resp = client.head(url).send().ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let etag = resp
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let len = resp
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    if etag.is_empty() && len.is_empty() {
+        return None;
+    }
+    Some(format!("{etag}|{len}"))
+}
+
 /// 构建内嵌引擎；任何一步失败都返回 None，由调用方退回硬编码解析。
 fn build_engine() -> Option<JsEngine> {
+    if ENGINE_OFFLINE.load(Ordering::Relaxed) {
+        return None;
+    }
     let dir = engine_dir();
-    match ensure_bundle(&dir, false, DEFAULT_JS_ZIP_URL, fetch_bytes) {
-        Ok(b) => eprintln!(
-            "[engine] {} 引擎包（{} 个文件）-> {}",
-            if b.downloaded { "已下载" } else { "复用" },
-            b.files.len(),
-            b.dir.display()
-        ),
+    // 服务商换过 js.zip 就重新拉：ETag/长度不一致即视为新版本。
+    let remote_tag = remote_js_tag(DEFAULT_JS_ZIP_URL);
+    let force = jsengine::needs_refresh(&dir, remote_tag.as_deref());
+    match ensure_bundle(&dir, force, DEFAULT_JS_ZIP_URL, fetch_bytes) {
+        Ok(b) => {
+            if b.downloaded {
+                if let Some(t) = remote_tag.as_deref() {
+                    jsengine::write_tag(&dir, t);
+                }
+            }
+            eprintln!(
+                "[engine] {} 引擎包（{} 个文件）-> {}",
+                if b.downloaded { "已下载/已更新" } else { "复用" },
+                b.files.len(),
+                b.dir.display()
+            );
+        }
         Err(e) => {
             eprintln!("[engine] 引擎包不可用，回退硬编码解析: {e}");
+            ENGINE_OFFLINE.store(true, Ordering::Relaxed);
             return None;
         }
     }
