@@ -111,6 +111,10 @@ function closeGroupMenu() {
 document.addEventListener("click", (e) => {
   if (!$("groupSelect").contains(e.target)) closeGroupMenu();
 });
+document.addEventListener("click", (e) => {
+  const el = $("lineSelect");
+  if (el && !el.contains(e.target)) closeLineMenu();
+});
 
 async function selectGroup(g) {
   currentGroup = g;
@@ -151,7 +155,7 @@ async function playChannel(c) {
   triedLines = new Set();            // 换频道重置换线记录
   stopWatchdog();
   $("nowTitle").textContent = c.name + (c.nowplay ? " · " + c.nowplay : "");
-  $("lineSwitch").innerHTML = "";
+  if ($("lineMenu")) $("lineMenu").innerHTML = "";
   lines = await invoke("get_lines", { ename: c.ename }).catch((e) => { showError("取源失败: " + e); return []; });
   if (lines.length === 0) {
     $("videoMsg").style.display = "block";
@@ -182,17 +186,25 @@ async function playChannel(c) {
 }
 
 function renderLines() {
-  const wrap = $("lineSwitch");
-  wrap.innerHTML = "";
+  const menu = $("lineMenu");
+  if (!menu) return;
+  menu.innerHTML = "";
+  // 仅列出可播放线路：不可播线路（需二次解析）直接隐藏，不再显示删除线，避免干扰
   lines.forEach((l, i) => {
-    const chip = document.createElement("button");
-    chip.className = "line-chip" + (i === currentLineIdx ? " active" : "") + (l.playable ? "" : " disabled");
-    chip.textContent = l.label || ("线路" + (i + 1));
-    chip.title = l.playable ? l.url : `${l.url}\n（该线路需二次解析，暂不支持播放）`;
-    chip.onclick = () => { currentLineIdx = i; renderLines(); playLine(i); };
-    wrap.appendChild(chip);
+    if (!l.playable) return;
+    const opt = document.createElement("button");
+    opt.className = "line-option" + (i === currentLineIdx ? " active" : "");
+    opt.innerHTML = `<span class="lo-idx">${i + 1}</span><span class="lo-label">${escapeHtml(l.label || ("线路" + (i + 1)))}</span>`;
+    opt.title = l.url;
+    opt.onclick = () => { currentLineIdx = i; renderLines(); closeLineMenu(); playLine(i); };
+    menu.appendChild(opt);
   });
+  const cur = lines[currentLineIdx];
+  const t = $("lineTriggerText");
+  if (t) t.textContent = (cur && cur.playable) ? ("线路·" + (cur.label || (currentLineIdx + 1))) : "线路";
 }
+function toggleLineMenu() { const el = $("lineSelect"); if (el) el.classList.toggle("open"); }
+function closeLineMenu() { const el = $("lineSelect"); if (el) el.classList.remove("open"); }
 
 let bufferWatchdog = null;   // 缓冲超时看门狗（12s，与安卓端一致）
 let triedLines = new Set();  // 本轮已尝试过的线路索引（避免死循环）
@@ -487,6 +499,31 @@ $("gsTrigger").addEventListener("click", (e) => {
 $("refreshBtn").addEventListener("click", () => {
   if (currentChannel) playChannel(currentChannel);
   else showError("请先选择频道");
+});
+
+// 线路下拉（底部向上展开）
+$("lineTrigger").addEventListener("click", (e) => { e.stopPropagation(); toggleLineMenu(); });
+
+// 全屏
+$("fullscreenBtn").addEventListener("click", async () => {
+  const wrap = $("videoWrap");
+  try {
+    if (document.fullscreenElement) {
+      await document.exitFullscreen();
+    } else if (wrap.requestFullscreen) {
+      await wrap.requestFullscreen();
+    } else if (wrap.webkitRequestFullscreen) {
+      wrap.webkitRequestFullscreen();
+    } else {
+      showToast("当前环境不支持全屏");
+    }
+  } catch (e) {
+    showToast("全屏切换失败：" + e);
+  }
+});
+document.addEventListener("fullscreenchange", () => {
+  const b = $("fullscreenBtn");
+  if (b) b.classList.toggle("active", !!document.fullscreenElement);
 });
 
 // 启动
