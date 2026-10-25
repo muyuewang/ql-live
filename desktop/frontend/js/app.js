@@ -199,9 +199,10 @@ function renderLines() {
     opt.onclick = () => { currentLineIdx = i; renderLines(); closeLineMenu(); playLine(i); };
     menu.appendChild(opt);
   });
-  const cur = lines[currentLineIdx];
+  const playableIdx = lines.map((l, i) => i).filter((i) => lines[i].playable);
+  const pos = playableIdx.indexOf(currentLineIdx) + 1;
   const t = $("lineTriggerText");
-  if (t) t.textContent = (cur && cur.playable) ? ("线路·" + (cur.label || (currentLineIdx + 1))) : "线路";
+  if (t) t.textContent = playableIdx.length ? ("线路 " + (pos || 1) + "/" + playableIdx.length) : "线路";
 }
 function toggleLineMenu() { const el = $("lineSelect"); if (el) el.classList.toggle("open"); }
 function closeLineMenu() { const el = $("lineSelect"); if (el) el.classList.remove("open"); }
@@ -370,7 +371,7 @@ function refreshToolbarState() {
   if (aspText) aspText.textContent = "比例·" + (["适配", "填充", "16:9", "4:3", "拉伸"][aspectMode] || "适配");
   $("autoLineBtn").classList.toggle("active", autoLine);
   const alText = $("autoLineBtnText");
-  if (alText) alText.textContent = "自动换线·" + (autoLine ? "开" : "关");
+  if (alText) alText.textContent = "换线·" + (autoLine ? "开" : "关");
 }
 
 // ===== 解码模式 / 比例 / 自动换线 =====

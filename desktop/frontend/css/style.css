@@ -362,7 +362,7 @@ svg { display: block; }
 
 /* ---------- 线路选择（底部向上展开） ---------- */
 .line-select { position: relative; display: inline-flex; }
-.line-trigger { gap: 7px; }
+.line-trigger { gap: 5px; }
 .line-trigger .line-caret { color: var(--text-faint); transition: transform 0.2s var(--ease); }
 .line-select.open .line-caret { transform: rotate(180deg); }
 .line-menu {
@@ -517,12 +517,17 @@ svg { display: block; }
 #toolbar {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 10px 20px;
+  gap: 4px;
+  padding: 8px 12px;
   background: var(--bg-panel);
   border-top: 1px solid var(--border-soft);
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
 }
+/* 底部工具栏更紧凑，保证一行放下 */
+#toolbar .tool-btn { padding: 7px 9px; gap: 5px; font-size: 12.5px; white-space: nowrap; }
+/* 纯操作类按钮只显示图标（保留 title 提示），为一行腾出空间 */
+#toolbar .ico-only { padding: 7px 8px; }
+#toolbar .ico-only span { display: none; }
 .tool-btn {
   display: inline-flex;
   align-items: center;
@@ -546,7 +551,7 @@ svg { display: block; }
 }
 .tool-btn svg { opacity: 0.85; }
 .tool-btn:hover svg, .tool-btn.active svg { opacity: 1; }
-.tool-sep { width: 1px; height: 22px; background: var(--border); margin: 0 7px; }
+.tool-sep { width: 1px; height: 22px; background: var(--border); margin: 0 4px; }
 
 /* ================= 弹层 ================= */
 .modal {
