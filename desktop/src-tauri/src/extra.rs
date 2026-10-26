@@ -68,25 +68,36 @@ fn save_prefs(app: &tauri::AppHandle, prefs: &Prefs) -> Result<(), String> {
 // EPG
 // ---------------------------------------------------------------------------
 
-fn build_client() -> reqwest::blocking::Client {
-    reqwest::blocking::Client::builder()
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36")
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .expect("build client")
+/// 进程级共享客户端（复用连接池/TLS 会话，别每次 EPG 都重新握手）
+fn build_client() -> &'static reqwest::blocking::Client {
+    static C: std::sync::OnceLock<reqwest::blocking::Client> = std::sync::OnceLock::new();
+    C.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36")
+            .timeout(std::time::Duration::from_secs(10))
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .build()
+            .expect("build client")
+    })
 }
 
 /// 拉取某频道当日 EPG。等价安卓 EpgFetcher：
 ///   GET http://sjapi.91kds.cn/api/get_epgall_by_ename.php?npw=1&ename=<ename>&day=yyyy-MM-dd
+///
+/// 网络请求必须离开 UI 线程（同步命令会阻塞窗口）。
 #[tauri::command]
-pub fn get_epg(ename: String) -> Result<Vec<EpgProgram>, String> {
+pub async fn get_epg(ename: String) -> Result<Vec<EpgProgram>, String> {
+    crate::off_ui(move || get_epg_blocking(&ename)).await?
+}
+
+fn get_epg_blocking(ename: &str) -> Result<Vec<EpgProgram>, String> {
     let day = {
         use chrono::prelude::*;
         Local::now().format("%Y-%m-%d").to_string()
     };
     let url = format!(
         "http://sjapi.91kds.cn/api/get_epgall_by_ename.php?npw=1&ename={}&day={}",
-        urlencoding::encode(&ename),
+        urlencoding::encode(ename),
         day
     );
     let client = build_client();
@@ -190,7 +201,18 @@ pub fn remove_custom(app: tauri::AppHandle, index: i64) -> Result<Vec<CustomChan
 ///   - `#EXTINF:-1,标题` 取标题（下一行非 # 行为 url）
 ///   - `名称,url` 单行格式
 #[tauri::command]
-pub fn import_custom(app: tauri::AppHandle, url: String) -> Result<Vec<CustomChannel>, String> {
+pub async fn import_custom(
+    app: tauri::AppHandle,
+    url: String,
+) -> Result<Vec<CustomChannel>, String> {
+    // 网络下载放后台线程，别冻窗口
+    crate::off_ui(move || import_custom_blocking(app, url)).await?
+}
+
+fn import_custom_blocking(
+    app: tauri::AppHandle,
+    url: String,
+) -> Result<Vec<CustomChannel>, String> {
     let client = build_client();
     let body = client.get(&url).send().map_err(|e| e.to_string())?;
     let text = body.text().map_err(|e| e.to_string())?;

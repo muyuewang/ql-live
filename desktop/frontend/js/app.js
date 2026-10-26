@@ -283,13 +283,132 @@ function armFirstFrameWatchdog() {
   }, FIRST_FRAME_WAIT);
 }
 
+// ===== 首片预取 =====
+// 实测这些源每片 3~5MB、目标时长 10s（约 3~4Mbps），而 HLS 首帧必须**下完一整片**
+// 才能 append 到 MSE —— 首帧时间几乎全部花在这一片上（本机实测 3.4~4.5s）。
+// 分片响应是 no-store 且每次刷新清单签名都会变，HTTP 缓存完全救不了，
+// 所以这里把字节存在 JS 内存里，用自定义 loader 直接喂给 hls.js：
+//   - 命中（已下完）→ 0 延迟起播
+//   - 在途（还在下）→ 等它，不重复下载
+//   - 未命中/失败 → 原样回退默认 XHR 加载器，行为与优化前完全一致
+
+const segCache = new Map();      // pathname -> { p: Promise<ArrayBuffer>, at, ms }
+const SEG_CACHE_MAX = 2;
+let segInflight = 0;             // 同时只允许一个分片预取在跑
+
+function segKey(url) {
+  try { return new URL(url, location.href).pathname; }
+  catch (e) { return String(url || "").split("?")[0]; }
+}
+
+function prefetchSegment(segUrl) {
+  if (!segUrl) return;
+  const k = segKey(segUrl);
+  if (!k || segCache.has(k)) return;
+  // 一条分片 3~5MB：鼠标扫过多个卡片时若并行预取，会把当前播放的带宽吃掉，
+  // 反而更卡。所以只留一路，其余的放弃（点下去时正常下载）。
+  if (segInflight > 0) return;
+  segInflight++;
+  const t0 = performance.now();
+  const rec = { at: Date.now(), ms: 0 };
+  rec.p = fetch(segUrl, { cache: "no-store" })
+    .then((r) => {
+      if (!r.ok) throw new Error("http " + r.status);
+      return r.arrayBuffer();
+    })
+    .then((buf) => {
+      // 字节级校验：确认拿到的是媒体数据而不是错误页 / 空响应，
+      // 否则绝不能喂给 MSE（会导致 append 失败、黑屏换线）。
+      const u8 = new Uint8Array(buf);
+      const isTs = u8.length > 188 && u8[0] === 0x47;
+      const isMp4 = u8.length > 12 && u8[4] === 0x66 && u8[5] === 0x74 &&
+        u8[6] === 0x79 && u8[7] === 0x70;   // "ftyp"
+      if (!isTs && !isMp4) throw new Error("not media");
+      rec.ms = Math.max(1, Math.round(performance.now() - t0));
+      return buf;
+    })
+    .catch((e) => {
+      if (segCache.get(k) === rec) segCache.delete(k);
+      throw e;
+    })
+    .finally(() => { segInflight = Math.max(0, segInflight - 1); });
+  rec.p.catch(() => {});          // 让未处理的拒绝安静掉
+  segCache.set(k, rec);
+  if (segCache.size > SEG_CACHE_MAX) {
+    const oldest = [...segCache.entries()].sort((a, b) => a[1].at - b[1].at)[0];
+    if (oldest) segCache.delete(oldest[0]);
+  }
+}
+
+function segStats(ms, bytes, t0) {
+  return {
+    aborted: false, loaded: bytes, retry: 0, total: bytes,
+    chunkCount: 1, bwEstimate: bytes * 8 / Math.max(0.05, ms / 1000),
+    parsing: { start: t0, end: t0 }, buffering: { start: 0, end: 0 },
+    trequest: t0, tfirst: t0, tload: t0 + ms,
+  };
+}
+
+/// 带首片缓存的 hls.js 加载器（未命中一律走原生实现）
+let SegLoaderClass = null;
+function segLoaderClass() {
+  if (SegLoaderClass) return SegLoaderClass;
+  const Base = (window.Hls && Hls.DefaultConfig && Hls.DefaultConfig.loader) || null;
+  if (!Base) return null;
+  SegLoaderClass = class extends Base {
+    load(context, config, callbacks) {
+      if (context && context.type === "frag" && context.url) {
+        const k = segKey(context.url);
+        const rec = k ? segCache.get(k) : null;
+        if (rec) {
+          segCache.delete(k);       // 一次性：用过就丢，避免内存堆积
+          const t0 = performance.now();
+          let done = false;
+          const fallback = () => {
+            if (done) return;
+            done = true;
+            super.load(context, config, callbacks);
+          };
+          // 在途的话最多再等 12s，超时回退（别把起播押在一个可能卡住的预取上）
+          const guard = setTimeout(fallback, 12000);
+          rec.p.then((buf) => {
+            if (done) return;
+            done = true;
+            clearTimeout(guard);
+            try {
+              callbacks.onSuccess(
+                { url: context.url, data: buf },
+                segStats(rec.ms || (performance.now() - t0), buf.byteLength, t0),
+                context, null
+              );
+            } catch (e) {
+              // onSuccess 内部抛错（极少见）→ 交给默认加载器重来
+              done = false;
+              fallback();
+            }
+          }).catch(() => { clearTimeout(guard); fallback(); });
+          return;
+        }
+      }
+      super.load(context, config, callbacks);
+    }
+    abort() {
+      try { super.abort(); } catch (e) { /* 命中缓存时没有 xhr，忽略 */ }
+    }
+  };
+  return SegLoaderClass;
+}
+
 // ===== 悬停预取 =====
-// 鼠标停在频道卡片上就把它的线路先在后台取好，并且顺手把 m3u8 和「起播位置
-// 那一片」提前下进 WebView 的 HTTP 缓存。这些源首片只有几 KB 却要 1s 以上，
-// 完全是 RTT 决定的，代码层面压不下去 —— 只能靠提前取回来。
+// 鼠标停在频道卡片上就把它的线路先在后台取好，顺手把首片字节拉进内存。
+// 这些源首片 3~5MB 且是 RTT+带宽双限，代码层面压不下去 —— 只能提前取。
 let prefetchTimer = null;
 const prewarmed = new Set();
 
+/// 只取清单：主要是建连（DNS/TCP），顺带拿到最新分片地址交给首片预取。
+/// 以前这里会把末两片整段下载下来，但分片 URL 带时效签名、响应还是 no-store，
+/// 到播放时 URL 早就变了，缓存永远命中不了 —— 等于白占 8MB 带宽，还会跟
+/// 真正的起播抢链路。现在只下清单（几百字节），分片交给 prefetchSegment 存内存。
 function prewarmUrl(url, depth) {
   if (!url || depth > 2) return;
   fetch(url, { cache: "default" })
@@ -306,13 +425,10 @@ function prewarmUrl(url, depth) {
         prewarmUrl(sub, depth + 1);
         return;
       }
-      // 取末尾两片（对应 hls.js liveSyncDurationCount:1 的起播位置）
-      items.slice(-2).forEach((seg) => {
-        let abs;
-        try { abs = new URL(seg, url).toString(); } catch (e) { return; }
-        // 必须把 body 读完才会进缓存
-        fetch(abs, { cache: "default" }).then((r) => r.arrayBuffer()).catch(() => {});
-      });
+      // 起播用的是最新那片（liveSyncDurationCount:1），预取它就够了
+      let seg;
+      try { seg = new URL(items[items.length - 1], url).toString(); } catch (e) { return; }
+      prefetchSegment(seg);
     })
     .catch(() => {});
 }
@@ -430,6 +546,12 @@ function holdCurrentFrame() {
 // ===== 播放 =====
 let playSeq = 0;   // 连点不同频道时，只让最后一次的取源结果生效
 async function playChannel(c) {
+  // 重复点同一个频道：正在播就别再重建播放器（重建一次白等好几秒）
+  if (currentChannel && c && currentChannel.ename === c.ename &&
+      hls && lines.length && $("video") && $("video").style.display !== "none" &&
+      !loadingSince) {
+    return;
+  }
   const seq = ++playSeq;
   currentChannel = c;
   switchT0 = performance.now();
@@ -482,6 +604,9 @@ async function playChannel(c) {
     return;
   }
   currentLineIdx = firstPlayable;
+  // 首条线路一确定就先把 CDN 连接预热起来（DNS/TCP/TLS + 清单 + 末两片），
+  // 与 hls.js 的首次请求并行跑。这些源多在海外，一次完整握手就要 200~400ms。
+  prewarmLine(lines[firstPlayable]);
   playLine(currentLineIdx);
 }
 
@@ -623,7 +748,7 @@ async function playLine(i) {
     destroyHls();
     // kdsvod 线路 302 到真实源站后需 AppleCoreMedia UA 才能拿正常分片（安卓端引擎附加头）
     const APPLE_UA = "AppleCoreMedia/1.0.0.l6F79 (iPhone; U; CPU OS 11_6 like Mac OS X; zh_cn)";
-    hls = new Hls({
+    const hlsCfg = {
       enableWorker: false,
       // 直播起播点：hls.js 默认要落后 3 个分片才开播。这些源多为 10s/片，
       // 等于白白多等 20~30s。收到 1 片即出画。
@@ -650,9 +775,30 @@ async function playLine(i) {
         xhr.setRequestHeader("User-Agent", isKdsvod ? APPLE_UA : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36");
         xhr.setRequestHeader("Referer", lineReferer);
       },
-    });
+    };
+    // 首片预取命中时直接把内存字节喂给 hls.js，省掉整段 3~5MB 下载；
+    // 关掉（localStorage segPreload=0）或环境不支持时保持原生加载器。
+    if (localStorage.getItem("segPreload") !== "0") {
+      const LC = segLoaderClass();
+      if (LC) hlsCfg.loader = LC;
+    }
+    hls = new Hls(hlsCfg);
     hls.loadSource(url);
     hls.attachMedia(video);
+
+    // 播放器侧分阶段打点：只有拿到这几行，才能分辨「慢在后端取源」还是
+    // 「慢在 CDN 拉清单/首片」——首帧总时长里这两块各占一半是常态。
+    hls.on(Hls.Events.MANIFEST_LOADED, (_e, d) => {
+      const nd = d && d.networkDetails;
+      const first = nd && nd.loading ? nd.loading.first : 0;
+      const end = nd && nd.loading ? nd.loading.end : 0;
+      diag(`hls清单 ${first ? Math.round(first) + "ms/" : ""}${end ? Math.round(end) + "ms" : "?"}`);
+    });
+    hls.on(Hls.Events.FRAG_LOADED, (_e, d) => {
+      const nd = d && d.networkDetails;
+      const first = nd && nd.loading ? nd.loading.first : 0;
+      if (first) diag(`hls首片 ${Math.round(first)}ms`);
+    });
 
     // MANIFEST 到手立刻起播（此时还在下分片），loading 等真正出帧再关
     hls.on(Hls.Events.MANIFEST_PARSED, () => { tryPlayVideo(video); });

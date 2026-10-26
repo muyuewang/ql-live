@@ -58,6 +58,24 @@ pub fn log(msg: &str) {
     }
 }
 
+/// 记录 UI 主线程 id。
+///
+/// Tauri 的同步命令默认跑在主线程上，网络请求会把窗口冻住；所有阻塞命令都必须
+/// 走 `off_ui` 落到独立线程。这里记下主线程 id，`off_ui` 就能自证「确实不在
+/// 主线程」，出问题时 perf.log 里一眼可见，不用靠猜。
+pub fn mark_main_thread() {
+    let _ = MAIN_TID.set(std::thread::current().id());
+}
+
+static MAIN_TID: OnceLock<std::thread::ThreadId> = OnceLock::new();
+
+pub fn on_main_thread() -> bool {
+    MAIN_TID
+        .get()
+        .map(|m| *m == std::thread::current().id())
+        .unwrap_or(false)
+}
+
 /// 阶段计时器：`let t = perf::Timer::new("fetch_source"); ... t.done();`
 pub struct Timer {
     what: &'static str,

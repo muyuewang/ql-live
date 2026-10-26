@@ -24,9 +24,11 @@ use std::time::{Duration, Instant};
 // ===== 取源结果缓存 =====
 //
 // 切台慢的体感里，有相当一部分是「刚看过、又切回来」的往返。
-// 缓存 2 分钟：线路在这段时间内几乎不会变，但过长会让失效线路一直留着。
+// 早期只缓存 2 分钟，用户切台来回扫一遍就过期了，等于每次都在冷启动。
+// 线路在 10 分钟内基本不会变；真失效了探测/首帧看门狗会自动换线，
+// 所以这里放宽到 10 分钟，换来「来回切台近乎瞬时」。
 
-const LINES_TTL: Duration = Duration::from_secs(120);
+const LINES_TTL: Duration = Duration::from_secs(600);
 
 struct Cached {
     at: Instant,
@@ -59,8 +61,16 @@ fn cache_has(ename: &str) -> bool {
 
 fn cache_put(ename: &str, lines: Vec<PlayLine>) {
     if let Ok(mut m) = lines_cache().lock() {
-        if m.len() > 64 {
-            m.clear(); // 简单封顶，避免长跑后无限增长
+        // 超过上限只淘汰最旧的一条：以前是 clear() 全清，
+        // 一跨过阈值就把所有频道的热缓存一起扔掉，切台重新变冷。
+        if m.len() >= 400 {
+            if let Some(oldest) = m
+                .iter()
+                .min_by_key(|(_, c)| c.at)
+                .map(|(k, _)| k.clone())
+            {
+                m.remove(&oldest);
+            }
         }
         m.insert(ename.to_string(), Cached { at: Instant::now(), lines });
     }
@@ -262,6 +272,39 @@ fn lines_for(ename: &str, allow_cache: bool) -> Result<Vec<PlayLine>, String> {
     Ok(out)
 }
 
+// ===== 线程模型 =====
+//
+// 重要：Tauri 的**同步命令**（`fn`，不是 `async fn`）是在 UI 主线程上执行的。
+// 这些命令里全是 reqwest 阻塞请求，一旦放主线程，整个窗口（含 WebView 重绘、
+// CSS 过渡、loading 动画）全被冻住 —— 表现就是「点了频道窗口卡住不动」。
+//
+// 所以所有会阻塞的命令一律走 `off_ui`：真正的阻塞动作放在独立 std::thread，
+// 主线程只 await 一个 recv。注意不能用 async_runtime::spawn_blocking 直接跑
+// reqwest 阻塞客户端（它内部会自建 runtime，在 Tokio 上下文中会卡死），
+// 必须落到自己的 std::thread 上。
+pub(crate) async fn off_ui<T, F>(f: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel::<T>();
+    std::thread::spawn(move || {
+        // 自证：真正的阻塞动作确实不在 UI 主线程上跑（只记一次，避免刷屏）
+        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            perf::log(&format!(
+                "off_ui 阻塞任务运行在主线程={}",
+                perf::on_main_thread()
+            ));
+        }
+        let _ = tx.send(f());
+    });
+    tauri::async_runtime::spawn_blocking(move || rx.recv())
+        .await
+        .map_err(|e| format!("后台任务失败: {e}"))?
+        .map_err(|e| format!("后台任务中断: {e}"))
+}
+
 // ===== Tauri 命令 =====
 
 #[derive(serde::Serialize)]
@@ -274,21 +317,24 @@ pub struct BootTarget {
 }
 
 #[tauri::command]
-fn get_groups() -> Result<Vec<String>, String> {
-    fetch_provs()
+async fn get_groups() -> Result<Vec<String>, String> {
+    off_ui(fetch_provs).await?
 }
 
 #[tauri::command]
-fn get_channels(group: String) -> Result<Vec<Channel>, String> {
-    fetch_group(&group)
+async fn get_channels(group: String) -> Result<Vec<Channel>, String> {
+    off_ui(move || fetch_group(&group)).await?
 }
 
 #[tauri::command]
-fn get_lines(ename: String) -> Result<Vec<PlayLine>, String> {
-    let t = perf::Timer::new("get_lines");
-    let r = lines_for(&ename, true);
-    t.done();
-    r
+async fn get_lines(ename: String) -> Result<Vec<PlayLine>, String> {
+    off_ui(move || {
+        let t = perf::Timer::new("get_lines");
+        let r = lines_for(&ename, true);
+        t.done();
+        r
+    })
+    .await?
 }
 
 /// 启动落点：按分组顺序找第一个真正有频道的分组，并取回它的频道列表。
@@ -376,9 +422,12 @@ fn perf_mark(msg: String) {
 ///
 /// 只在用户真正选中该线路时调用——P2P 引擎一次只能跑一路，
 /// 无法像 kdsvod 那样在 get_lines 阶段批量预解析。
+///
+/// 首次启动要等 P2P 网络握手（可能几十秒），必须离开 UI 线程，
+/// 否则整个窗口在这段时间里完全无响应。
 #[tauri::command]
-fn resolve_tvbus(line: String) -> Result<String, String> {
-    tvbus::resolve(&line)
+async fn resolve_tvbus(line: String) -> Result<String, String> {
+    off_ui(move || tvbus::resolve(&line)).await?
 }
 
 /// 命令行测速：`ql-live.exe --bench=8`（配合 QL_PERF=1）。
@@ -528,6 +577,7 @@ fn measure_first_segment(url: &str) -> String {
 
 fn main() {
     perf::init();
+    perf::mark_main_thread();
     if std::env::args().any(|a| a.starts_with("--bench")) {
         bench();
         return;
