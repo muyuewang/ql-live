@@ -32,6 +32,9 @@ const LINES_TTL: Duration = Duration::from_secs(600);
 struct Cached {
     at: Instant,
     lines: Vec<PlayLine>,
+    /// 是否做过「全量解析」（深度模式）。浅缓存只解析了前几条，
+    /// 里面可能根本没有低码率线路，需要后台升级成深度。
+    deep: bool,
 }
 
 fn lines_cache() -> &'static Mutex<HashMap<String, Cached>> {
@@ -51,14 +54,18 @@ fn cache_fresh(ename: &str) -> Option<Vec<PlayLine>> {
     }
 }
 
-fn cache_has(ename: &str) -> bool {
+/// 缓存里这份是不是「全量解析」的结果（含低码率线路）
+fn cache_is_deep(ename: &str) -> bool {
     match lines_cache().lock() {
-        Ok(m) => m.get(ename).map(|c| c.at.elapsed() < LINES_TTL).unwrap_or(false),
+        Ok(m) => m
+            .get(ename)
+            .map(|c| c.deep && c.at.elapsed() < LINES_TTL)
+            .unwrap_or(false),
         Err(_) => false,
     }
 }
 
-fn cache_put(ename: &str, lines: Vec<PlayLine>) {
+fn cache_put(ename: &str, lines: Vec<PlayLine>, deep: bool) {
     if let Ok(mut m) = lines_cache().lock() {
         // 超过上限只淘汰最旧的一条：以前是 clear() 全清，
         // 一跨过阈值就把所有频道的热缓存一起扔掉，切台重新变冷。
@@ -71,7 +78,10 @@ fn cache_put(ename: &str, lines: Vec<PlayLine>) {
                 m.remove(&oldest);
             }
         }
-        m.insert(ename.to_string(), Cached { at: Instant::now(), lines });
+        m.insert(
+            ename.to_string(),
+            Cached { at: Instant::now(), lines, deep },
+        );
     }
 }
 
@@ -191,7 +201,12 @@ fn resolve_batch(items: &[(usize, String, String)], out: &mut [PlayLine]) {
 }
 
 /// 把原始线路串整理成前端可用形态：分类 + 分批解析 + 并行探测。
-fn collect_lines(raw: Vec<PlayLine>) -> Vec<PlayLine> {
+///
+/// `deep = false`（点击路径）：解析到第一条可播线路就收工，优先保证响应快。
+/// `deep = true`（悬停预取路径）：把线路表解析到底，直到出现「低码率可播线路」。
+/// 低码率变体（`/live/xxxmd.m3u8`，单片约 1.3MB）只有全量解析才可能碰到——
+/// 实测一个频道十几条线路里只有 0~4 条是低码率，且位置不固定。
+fn collect_lines(raw: Vec<PlayLine>, deep: bool) -> Vec<PlayLine> {
     let mut out: Vec<PlayLine> = Vec::with_capacity(raw.len());
     // (在 out 中的下标, 原始串, 协议类型) —— 需要二次解析的线路
     let mut queue: Vec<(usize, String, String)> = Vec::new();
@@ -223,8 +238,14 @@ fn collect_lines(raw: Vec<PlayLine>) -> Vec<PlayLine> {
         }
     }
 
+    let has_low = |out: &[PlayLine]| {
+        out.iter().any(|l| {
+            l.playable && is_low_bitrate(l.url.split('?').next().unwrap_or(""))
+        })
+    };
+
     // 已有直连线路 → 首播不等解析，只把第一批当备选解析掉
-    if out.iter().any(|l| l.playable) {
+    if out.iter().any(|l| l.playable) && !deep {
         let end = queue.len().min(PARSE_BATCH);
         if end > 0 {
             resolve_batch(&queue[..end], &mut out);
@@ -232,23 +253,28 @@ fn collect_lines(raw: Vec<PlayLine>) -> Vec<PlayLine> {
         return out;
     }
 
-    // 没有直连 → 逐批解析，直到出现可播线路
+    // 逐批解析
     let mut pos = 0usize;
     while pos < queue.len() {
         let end = (pos + PARSE_BATCH).min(queue.len());
         let t = perf::Timer::new("lines.batch");
         resolve_batch(&queue[pos..end], &mut out);
-        let ok = queue[pos..end].iter().filter(|(i, _, _)| out[*i].playable).count();
-        t.done_q(&format!("第 {}-{} 条，可播 {}", pos + 1, end, ok));
-        if ok > 0 {
+        pos = end;
+        let ok = out.iter().filter(|l| l.playable).count();
+        t.done_q(&format!("第 1-{end} 条，累计可播 {ok}"));
+        if deep {
+            // 深度模式：已经找到低码率可播线路就停，剩下的没必要再解析
+            if has_low(&out) {
+                break;
+            }
+        } else if ok > 0 {
             break;
         }
-        pos = end;
     }
     out
 }
 
-fn lines_for(ename: &str, allow_cache: bool) -> Result<Vec<PlayLine>, String> {
+fn lines_for(ename: &str, allow_cache: bool, deep: bool) -> Result<Vec<PlayLine>, String> {
     if allow_cache {
         if let Some(v) = cache_fresh(ename) {
             perf::log(&format!("lines[{ename}] 缓存命中（{} 条）", v.len()));
@@ -260,14 +286,15 @@ fn lines_for(ename: &str, allow_cache: bool) -> Result<Vec<PlayLine>, String> {
     t.done_q(&format!("{} 条", raw.len()));
 
     let t2 = perf::Timer::new("lines.collect");
-    let out = collect_lines(raw);
+    let out = collect_lines(raw, deep);
     t2.done_q(&format!(
-        "可播 {}/{}",
+        "可播 {}/{}（{}）",
         out.iter().filter(|l| l.playable).count(),
-        out.len()
+        out.len(),
+        if deep { "全量" } else { "浅" }
     ));
 
-    cache_put(ename, out.clone());
+    cache_put(ename, out.clone(), deep);
     Ok(out)
 }
 
@@ -329,7 +356,7 @@ async fn get_channels(group: String) -> Result<Vec<Channel>, String> {
 async fn get_lines(ename: String) -> Result<Vec<PlayLine>, String> {
     off_ui(move || {
         let t = perf::Timer::new("get_lines");
-        let r = lines_for(&ename, true);
+        let r = lines_for(&ename, true, false);
         t.done();
         r
     })
@@ -381,13 +408,18 @@ async fn boot_target() -> Result<BootTarget, String> {
 
 /// 后台预取某个频道的线路（鼠标悬停/光标停留时由前端触发）。
 ///
-/// 顺带把线路列表返回给前端：前端拿首条可播地址去预热播放器的 HTTP 缓存
-/// （这些源首片只有几 KB 却要 1s+，纯 RTT 决定，只能靠提前取）。
+/// 这条路径是「全量解析」：实测一个频道十几条线路里只有 0~4 条是低码率变体
+/// （`/live/xxxmd.m3u8`，单片约 1.3MB vs 4.2MB，首帧差 3 倍），位置还不固定。
+/// 点击时只解析前几条（要快），所以低码率线路往往不在里面 —— 只有在悬停预取
+/// 时把线路表走到底，才能真正选到快的那条。解析到低码率可播线路即停，不会白跑。
+///
+/// 顺带把线路列表返回给前端：前端拿首条可播地址去预热播放器的 HTTP 缓存。
 #[tauri::command]
 async fn prefetch_lines(ename: String) -> Vec<PlayLine> {
     tauri::async_runtime::spawn_blocking(move || {
-        if cache_has(&ename) {
-            return lines_for(&ename, true).unwrap_or_default();
+        // 已有深度缓存 → 直接给（这也是「切回看过的频道瞬间起播」的关键）
+        if cache_is_deep(&ename) {
+            return lines_for(&ename, true, true).unwrap_or_default();
         }
         {
             let mut s = match inflight().lock() {
@@ -398,8 +430,8 @@ async fn prefetch_lines(ename: String) -> Vec<PlayLine> {
                 return Vec::new(); // 已在预取中
             }
         }
-        let t = perf::Timer::new("prefetch");
-        let r = lines_for(&ename, false).unwrap_or_default();
+        let t = perf::Timer::new("prefetch(deep)");
+        let r = lines_for(&ename, false, true).unwrap_or_default();
         t.done_q(&format!("{} 条", r.len()));
         if let Ok(mut s) = inflight().lock() {
             s.remove(&ename);
@@ -415,6 +447,124 @@ async fn prefetch_lines(ename: String) -> Vec<PlayLine> {
 #[tauri::command]
 fn perf_mark(msg: String) {
     perf::log(&format!("[ui] {msg}"));
+}
+
+/// 路径里带 md/ld/sd 视为低码率变体（实测同一频道 /live/cctv1md/ 每片约 1.3MB，
+/// /live/cctv1/ 约 4.2MB）。签名与路径绑定，无法自行改写，只能靠选线路。
+fn is_low_bitrate(path: &str) -> bool {
+    let p = path.to_ascii_lowercase();
+    for t in ["md", "ld", "sd"] {
+        if p.contains(&format!("/{t}/")) || p.ends_with(&format!("{t}.m3u8")) {
+            return true;
+        }
+        // /live/cctv1md.m3u8、/live/cctv1md/segment_1.ts 这种「名字后缀」形态
+        if let Some(idx) = p.find(&format!("{t}.m3u8")) {
+            let before = &p[..idx];
+            if before.chars().last().map(|c| c.is_ascii_alphanumeric()).unwrap_or(false) {
+                return true;
+            }
+        }
+        if p.contains(&format!("{t}/segment")) {
+            return true;
+        }
+    }
+    false
+}
+
+/// 诊断：把几个频道的**全部**线路解析出来，统计码率变体分布。
+/// 用法：`ql-live.exe --survey=8`（结果写 perf.log，前缀 SURVEY）
+fn survey(n: usize) {
+    engine_host::prewarm();
+    let t0 = Instant::now();
+    while !engine_host::is_ready() && t0.elapsed() < Duration::from_secs(45) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let provs = match fetch_provs() {
+        Ok(p) => p,
+        Err(e) => {
+            perf::log(&format!("分组获取失败: {e}"));
+            return;
+        }
+    };
+    let mut ch_done = 0usize;
+    let mut mixed = 0usize;
+    'outer: for p in &provs {
+        let chs = match fetch_group(p) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        for c in &chs {
+            let raw = match fetch_source(&c.ename) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let mut out: Vec<PlayLine> = Vec::new();
+            let mut queue: Vec<(usize, String, String)> = Vec::new();
+            for l in raw {
+                let r = resolve_playable(&l.url);
+                let idx = out.len();
+                let needs = r.kind == "htmlplay"
+                    || (r.kind == "kdsvod" && !r.playable && l.url.contains("pwd=jsdecode"));
+                if needs {
+                    out.push(PlayLine {
+                        url: r.url.clone(),
+                        label: l.label,
+                        playable: false,
+                        kind: r.kind.clone(),
+                        referer: String::new(),
+                        hls: false,
+                    });
+                    queue.push((idx, l.url, r.kind));
+                } else {
+                    out.push(PlayLine {
+                        url: r.url,
+                        label: l.label,
+                        playable: r.playable,
+                        kind: r.kind,
+                        referer: String::new(),
+                        hls: false,
+                    });
+                }
+            }
+            let mut pos = 0usize;
+            while pos < queue.len() {
+                let end = (pos + 6).min(queue.len());
+                resolve_batch(&queue[pos..end], &mut out);
+                pos = end;
+            }
+            let (mut n_low, mut n_hi, mut n_dead) = (0, 0, 0);
+            for l in &out {
+                let path = l.url.split('?').next().unwrap_or("");
+                let low = is_low_bitrate(path);
+                if !l.playable {
+                    n_dead += 1;
+                } else if low {
+                    n_low += 1;
+                } else {
+                    n_hi += 1;
+                }
+                perf::log(&format!(
+                    "SURVEY {} | {} | {} | {}",
+                    c.name,
+                    l.label,
+                    if low { "低码率" } else { "高码率" },
+                    path
+                ));
+            }
+            perf::log(&format!(
+                "SURVEY_SUM {}: 低{} 高{} 不可播{}",
+                c.name, n_low, n_hi, n_dead
+            ));
+            if n_low > 0 && n_hi > 0 {
+                mixed += 1;
+            }
+            ch_done += 1;
+            if ch_done >= n {
+                break 'outer;
+            }
+        }
+    }
+    perf::log(&format!("SURVEY_DONE 频道{ch_done} 混合变体{mixed}"));
 }
 
 /// 命令行测速：`ql-live.exe --bench=8`（配合 QL_PERF=1）。
@@ -457,7 +607,7 @@ fn bench() {
         };
         for c in chs.iter().take(n) {
             let t = perf::Timer::new("BENCH 切台(冷)");
-            match lines_for(&c.ename, false) {
+            match lines_for(&c.ename, false, false) {
                 Ok(v) => {
                     let ok = v.iter().filter(|l| l.playable).count();
                     t.done_q(&format!("{} | 可播 {}/{}", c.name, ok, v.len()));
@@ -480,7 +630,7 @@ fn bench() {
     // 缓存命中路径
     if first_cold.is_some() {
         let t = perf::Timer::new("BENCH 切台(缓存命中)");
-        match lines_for(&first_ename, true) {
+        match lines_for(&first_ename, true, false) {
             Ok(v) => {
                 t.done_q(&format!("{} 条", v.len()));
             }
@@ -489,6 +639,31 @@ fn bench() {
             }
         }
     }
+    // 深度解析（悬停预取走的路径）：验证全量解析能不能真找到低码率线路，以及代价多大
+    if !first_ename.is_empty() {
+        let t = perf::Timer::new("BENCH 深度解析(全量)");
+        match lines_for(&first_ename, false, true) {
+            Ok(v) => {
+                let low = v
+                    .iter()
+                    .filter(|l| l.playable && is_low_bitrate(l.url.split('?').next().unwrap_or("")))
+                    .count();
+                let first_low = v
+                    .iter()
+                    .position(|l| l.playable && is_low_bitrate(l.url.split('?').next().unwrap_or("")));
+                t.done_q(&format!(
+                    "可播 {}/{}，低码率 {low} 条，首条低码率在第 {} 位",
+                    v.iter().filter(|l| l.playable).count(),
+                    v.len(),
+                    first_low.map(|i| i + 1).unwrap_or(0)
+                ));
+            }
+            Err(e) => {
+                t.done_q(&format!("失败 {e}"));
+            }
+        }
+    }
+
     // 首屏链路：m3u8 → 首个分片。用来量化「拿到地址之后」到能出第一帧之前
     // 到底花在 302 跳转、清单还是分片下载上。
     if let Some(v) = &first_cold {
@@ -567,6 +742,10 @@ fn main() {
     perf::mark_main_thread();
     if std::env::args().any(|a| a.starts_with("--bench")) {
         bench();
+        return;
+    }
+    if let Some(n) = std::env::args().find_map(|a| a.strip_prefix("--survey=").and_then(|s| s.parse::<usize>().ok())) {
+        survey(n.max(1));
         return;
     }
     // 一眼可辨的运行模式：prod 走内嵌资源，dev 会去连 devUrl（打包后必白屏）

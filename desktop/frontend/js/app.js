@@ -216,19 +216,76 @@ function rememberFastLine(ms) {
   } catch (e) { /* 配额满等，忽略 */ }
 }
 
-/** 命中历史快线就把它提到第一位，返回原索引（-1 表示没命中） */
+/** 命中历史快线就把它提到第一位，返回原索引（-1 表示没命中）
+ *  优先级：手动选过的线路 > 上次出帧最快的线路 */
 function promoteFastLine() {
   const ch = currentChannel;
   if (!ch || !ch.ename || lines.length < 2) return -1;
-  let o = null;
-  try { o = JSON.parse(localStorage.getItem(fastLineKey(ch.ename)) || "null"); } catch (e) { return -1; }
-  if (!o || !o.u) return -1;
-  if (Date.now() - (o.t || 0) > FAST_LINE_TTL) return -1;
-  const i = lines.findIndex((l) => l.url === o.u && isPlayable(l));
-  if (i <= 0) return -1;    // 已失效或本来就在首位
+  const pick = (u) => {
+    if (!u) return -1;
+    const i = lines.findIndex((l) => l.url === u && isPlayable(l));
+    return i > 0 ? i : -1;   // 已失效或本来就在首位
+  };
+  let i = pick(manualLineUrl(ch.ename));
+  if (i < 0) {
+    let o = null;
+    try { o = JSON.parse(localStorage.getItem(fastLineKey(ch.ename)) || "null"); } catch (e) { return -1; }
+    if (!o || !o.u) return -1;
+    if (Date.now() - (o.t || 0) > FAST_LINE_TTL) return -1;
+    i = pick(o.u);
+  }
+  if (i <= 0) return -1;
   const [it] = lines.splice(i, 1);
   lines.unshift(it);
   return i;
+}
+
+// ---- 码率变体：优先选「低码率」线路起播 ----
+// 实测同一频道的不同线路会指向两个码率变体：
+//   /live/cctv1md.m3u8  每片约 1.3MB   ← 快
+//   /live/cctv1.m3u8    每片约 4.2MB   ← 慢 3 倍
+// 标签都是 cdnXXXXk1080p，看不出区别；签名又与路径绑定、不能自行改写，
+// 所以只能在「线路之间」挑。代价是画质会软一些（1.1Mbps vs 3.4Mbps），
+// 不想要就把 localStorage 的 fastStart 设成 0。
+const fastStart = localStorage.getItem("fastStart") !== "0";
+
+function tier(l) {
+  if (!l || !l.url) return 1;
+  const p = String(l.url).split("?")[0].toLowerCase();
+  return /(md|ld|sd)(\.m3u8|\/)/.test(p) ? 0 : 1;
+}
+
+// 起播后让后端把该频道线路表「全量解析」一遍落缓存（只拉清单，每条约 1KB）。
+// 点击路径为了快只解析前几条，低码率线路常常不在里面；升级后下次切回来就能选到快线。
+const upgradingLines = new Set();
+function upgradeLinesCache(ename) {
+  if (!ename || upgradingLines.has(ename)) return;
+  // 同一时间只升级一个频道：连点换台时不要堆出十几路后台解析
+  if (upgradingLines.size > 0) return;
+  upgradingLines.add(ename);
+  invoke("prefetch_lines", { ename })
+    .catch(() => {})
+    .then(() => upgradingLines.delete(ename));
+}
+
+// 用户手动选过的线路要「钉住」：低码率优先只是默认策略，
+// 他手动挑了高清线，下次就该还是那条（否则会被自动排序顶掉）。
+function rememberManualLine() {
+  const ch = currentChannel;
+  const line = lines[currentLineIdx];
+  if (!ch || !ch.ename || !line || !line.url) return;
+  try {
+    localStorage.setItem("manualline_" + ch.ename,
+      JSON.stringify({ u: line.url, t: Date.now() }));
+  } catch (e) { /* 配额满等，忽略 */ }
+}
+function manualLineUrl(ename) {
+  try {
+    const o = JSON.parse(localStorage.getItem("manualline_" + ename) || "null");
+    if (!o || !o.u) return "";
+    if (Date.now() - (o.t || 0) > 30 * 86400000) return "";
+    return o.u;
+  } catch (e) { return ""; }
 }
 
 function markFirstFrame(tag) {
@@ -612,7 +669,7 @@ async function playChannel(c) {
     if (l.kind === "rtmp") return 2;
     return 3;
   };
-  lines.sort((a, b) => rank(a) - rank(b));
+  lines.sort((a, b) => (rank(a) - rank(b)) || (tier(a) - tier(b)));
   // 本频道上次出帧最快的线路提到第一位（切过一次之后，回来直接就快线）
   const movedFrom = promoteFastLine();
   renderLines();
@@ -629,10 +686,16 @@ async function playChannel(c) {
     return;
   }
   currentLineIdx = firstPlayable;
+  if (fastStart) {
+    diag(`选线 ${c.name} 第${firstPlayable + 1}条 ${tier(lines[firstPlayable]) === 0 ? "低码率" : "标准"}`);
+  }
   // 注意：这里不要「点击时再预取首片」——hls.js 自己会立刻拉同一个清单和分片，
   // 再预取一份只是多占一条连接和带宽，反而拖慢真正的起播。
   // 首片预取只在鼠标悬停时做（那时用户还没点，带宽闲着）。
   playLine(currentLineIdx);
+  // 起播后再让后端把这个频道「全量解析」一遍落到缓存里：点击路径只解析了前几条，
+  // 低码率线路常常不在其中。下次切回本频道（或悬停时）就能直接选到快线。
+  if (fastStart) upgradeLinesCache(c.ename);
 }
 
 function renderLines() {
@@ -646,7 +709,7 @@ function renderLines() {
     opt.className = "line-option" + (i === currentLineIdx ? " active" : "");
     opt.innerHTML = `<span class="lo-idx">${i + 1}</span><span class="lo-label">${escapeHtml(l.label || ("线路" + (i + 1)))}</span>`;
     opt.title = l.url;
-    opt.onclick = () => { currentLineIdx = i; renderLines(); closeLineMenu(); playLine(i); };
+    opt.onclick = () => { currentLineIdx = i; rememberManualLine(); renderLines(); closeLineMenu(); playLine(i); };
     menu.appendChild(opt);
   });
   const playableIdx = lines.map((l, i) => i).filter((i) => isPlayable(lines[i]));
