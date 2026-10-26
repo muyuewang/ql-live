@@ -124,6 +124,8 @@ public class MainActivity extends Activity implements PlayerEngine.Listener {
         store = new ChannelStore(this);
         store.ensureSeeded();
         copyEngineJs();
+        // 原版由 StartActivity 启动页负责的算法包热更新，在自绘入口里补回来。
+        JsUpdater.updateAsync(this);
         engine = new PlayerEngine(this, this);
 
         buildUi();
@@ -980,6 +982,7 @@ public class MainActivity extends Activity implements PlayerEngine.Listener {
 
     private void playChannel(final ChannelStore.Channel ch) {
         final int gen = ++playGen;
+        Perf.start(ch.name);
         curPlayCh = ch;
         curPlayCh = ch;
         ArrayList<String> dbLines = ch.getLines();
@@ -1004,8 +1007,10 @@ public class MainActivity extends Activity implements PlayerEngine.Listener {
                     ArrayList<String> lines = new ArrayList<String>();
                     lines.addAll(live);
                     if (lines.isEmpty()) lines.addAll(ch.getLines());
+                    ArrayList<String> lbs = new ArrayList<String>(labels);
+                    promoteLastLine(ch.ename, lines, lbs);   // 上次快的那条提到首位
                     curLines = lines;
-                    curLineLabels = labels;
+                    curLineLabels = lbs;
                     curLineIdx = 0;
                     engine.setChannelLines(lines, 0);
                     startPlay(gen, ch, lines, 0);
@@ -1019,8 +1024,10 @@ public class MainActivity extends Activity implements PlayerEngine.Listener {
                         showBigOsd(ch, "该频道暂无可用线路");
                         return;
                     }
+                    ArrayList<String> lbs = buildLabels(lines);
+                    promoteLastLine(ch.ename, lines, lbs);
                     curLines = lines;
-                    curLineLabels = buildLabels(lines);
+                    curLineLabels = lbs;
                     curLineIdx = 0;
                     engine.setChannelLines(lines, 0);
                     startPlay(gen, ch, lines, 0);
@@ -1038,6 +1045,93 @@ public class MainActivity extends Activity implements PlayerEngine.Listener {
                 }
             }
         }}, 7000);
+        prefetchNeighbors(ch);
+    }
+
+    /** 预取上下相邻频道的线路列表：用遥控器顺序换台时目标频道已在缓存里 */
+    private void prefetchNeighbors(ChannelStore.Channel ch) {
+        if (curChannels.size() < 2 || ch == null || ch.ename == null) return;
+        int idx = -1;
+        for (int i = 0; i < curChannels.size(); i++) {
+            if (ch.ename.equals(curChannels.get(i).ename)) { idx = i; break; }
+        }
+        if (idx < 0) return;
+        int n = curChannels.size();
+        OnlineSource.prefetch(this, curChannels.get((idx + 1) % n).ename);
+        OnlineSource.prefetch(this, curChannels.get((idx - 1 + n) % n).ename);
+    }
+
+    // ---------------- 线路质量记忆 ----------------
+    // 同一个频道十几二十条线路，快慢差好几倍（实测同一频道 0.9s ~ 5.5s 都有）。
+    // 这里做两件事：
+    //   1) 记住该频道出帧最快的线路，下次直接优先它；
+    //   2) 首帧超过 4s 的线路标记为慢，下次降到最后（然后自然探索到下一条）。
+    // 用户切几次之后，常用频道就会稳定走最快的那条。
+
+    private static final long FAST_LINE_MS = 3500;   // 首帧 <= 此值才算「快线路」
+    private static final long SLOW_LINE_MS = 4000;   // 首帧 > 此值标记为慢线路
+
+    private void promoteLastLine(String ename, ArrayList<String> lines, ArrayList<String> labels) {
+        if (ename == null || lines == null || lines.size() < 2) return;
+        String best = null, slow = null;
+        long bestMs = 0;
+        try {
+            best = prefs().getString("bestline_" + ename, null);
+            bestMs = prefs().getLong("bestms_" + ename, 0);
+            slow = prefs().getString("slowline_" + ename, null);
+        } catch (Throwable ignored) {}
+        if (best != null && bestMs > 0 && bestMs <= FAST_LINE_MS) {
+            int i = lines.indexOf(best);
+            if (i > 0) {
+                moveTo(lines, labels, i, 0);
+                Perf.mark("line.best", "原第" + (i + 1) + "条 " + bestMs + "ms");
+            }
+        }
+        if (slow != null && !slow.equals(best) && lines.size() > 2) {
+            int i = lines.indexOf(slow);
+            if (i >= 0 && i < lines.size() - 1) {
+                moveTo(lines, labels, i, lines.size() - 1);
+                Perf.mark("line.skipSlow", "原第" + (i + 1) + "条降级");
+            }
+        }
+    }
+
+    /** 把 lines/labels 的第 from 项移到第 to 项（两个列表保持同序） */
+    private static void moveTo(ArrayList<String> lines, ArrayList<String> labels, int from, int to) {
+        if (from == to || from < 0 || from >= lines.size()) return;
+        String l = lines.remove(from);
+        lines.add(Math.min(to, lines.size()), l);
+        if (labels != null && labels.size() == lines.size() && from < labels.size()) {
+            String lb = labels.remove(from);
+            labels.add(Math.min(to, labels.size()), lb);
+        }
+    }
+
+    private void recordLineSpeed(String ename, String raw, long ms) {
+        if (ename == null || raw == null || ms <= 0) return;
+        try {
+            android.content.SharedPreferences.Editor ed = prefs().edit();
+            if (ms <= FAST_LINE_MS) {
+                long bestMs = prefs().getLong("bestms_" + ename, Long.MAX_VALUE);
+                String bestRaw = prefs().getString("bestline_" + ename, null);
+                if (raw.equals(bestRaw) || ms < bestMs) {
+                    ed.putString("bestline_" + ename, raw).putLong("bestms_" + ename, ms);
+                }
+            } else if (ms > SLOW_LINE_MS) {
+                ed.putString("slowline_" + ename, raw);
+            }
+            ed.apply();
+        } catch (Throwable ignored) {}
+    }
+
+    public void onLineOk(final int lineIdx, final long ms) {
+        ui.post(new Runnable() { public void run() {
+            ChannelStore.Channel ch = curPlayCh;
+            if (ch == null || lineIdx < 0 || lineIdx >= curLines.size()) return;
+            String raw = curLines.get(lineIdx);
+            recordLineSpeed(ch.ename, raw, ms);
+            Perf.mark("line.score", "第" + (lineIdx + 1) + "条 " + ms + "ms");
+        }});
     }
 
     private void startPlay(int gen, ChannelStore.Channel ch, ArrayList<String> lines, int lineIdx) {
@@ -1722,8 +1816,24 @@ public class MainActivity extends Activity implements PlayerEngine.Listener {
             if (curChannels.isEmpty()) return;
             panelChanPos = Math.max(0, Math.min(curChannels.size() - 1, panelChanPos + delta));
             channelList.setSelection(panelChanPos);
+            scheduleCursorPrefetch();
         }
         refreshPanelFocus();
+    }
+
+    // 光标在频道面板上停留 180ms 就预取该频道线路：浏览时先把源抓好，
+    // 按 OK 时基本直接命中缓存，不用再等一次网络。
+    private Runnable cursorPrefetch;
+    private void scheduleCursorPrefetch() {
+        if (cursorPrefetch != null) ui.removeCallbacks(cursorPrefetch);
+        cursorPrefetch = new Runnable() { public void run() {
+            int p = panelChanPos;
+            if (p >= 0 && p < curChannels.size()) {
+                ChannelStore.Channel c = curChannels.get(p);
+                if (c != null) OnlineSource.prefetch(MainActivity.this, c.ename);
+            }
+        }};
+        ui.postDelayed(cursorPrefetch, 180);
     }
 
     private void activatePanelCursor() {

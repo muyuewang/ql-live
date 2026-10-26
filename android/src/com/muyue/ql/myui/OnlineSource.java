@@ -1,6 +1,8 @@
 package com.muyue.ql.myui;
 
 import android.app.Activity;
+import android.os.Handler;
+import android.os.Looper;
 import com.jiaoxiang.fangnale.bean.SourceListBean;
 import com.jiaoxiang.fangnale.net.NetConstant;
 import com.jiaoxiang.fangnale.utils.AesUtil;
@@ -9,6 +11,8 @@ import com.jiaoxiang.fangnale.utils.NativeEncrypt;
 import com.jiaoxiang.fangnale.utils.OkHttpClientManager;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 
 /**
@@ -24,12 +28,70 @@ public class OnlineSource {
         void onError();
     }
 
+    // ---------------- 线路缓存 ----------------
+    // 切台时每次都能命中：同一频道来回切不再重复请求网络。
+    // get_source2024 返回的就是线路地址列表，不含时效签名，缓存 3 分钟足够安全。
+    private static final long TTL = 180_000;
+    private static final HashMap<String, Entry> CACHE = new HashMap<String, Entry>();
+    private static final HashSet<String> PENDING = new HashSet<String>();
+    private static final Handler MAIN = new Handler(Looper.getMainLooper());
+
+    private static class Entry {
+        ArrayList<String> lines;
+        ArrayList<String> labels;
+        long ts;
+    }
+
+    /** 预热：把线路列表提前抓进缓存（失败静默）。 */
+    public static void prefetch(Activity act, String ename) {
+        if (ename == null || ename.length() == 0) return;
+        if (ename.startsWith("custom_")) return;
+        synchronized (CACHE) {
+            Entry e = CACHE.get(ename);
+            if (e != null && System.currentTimeMillis() - e.ts < TTL) return;
+            if (PENDING.contains(ename)) return;
+            PENDING.add(ename);
+        }
+        fetch(act, ename, new Callback() {
+            public void onLines(ArrayList<String> l, ArrayList<String> b) { /* 只填缓存 */ }
+            public void onError() { /* 静默 */ }
+        }, false, true);   // quiet：预取不写入切台时间轴，避免日志噪声
+    }
+
+    /** 清掉某频道的缓存（播放失败重试时用） */
+    public static void invalidate(String ename) {
+        if (ename == null) return;
+        synchronized (CACHE) { CACHE.remove(ename); }
+    }
+
     public static void fetch(Activity act, String ename, final Callback cb) {
+        fetch(act, ename, cb, false, false);
+    }
+
+    private static void fetch(final Activity act, final String ename, final Callback cb,
+                              boolean noCache, final boolean quiet) {
+        // 1) 命中缓存：直接回调（切台瞬间出线路）
+        if (!noCache) {
+            Entry hit = null;
+            synchronized (CACHE) {
+                Entry e = CACHE.get(ename);
+                if (e != null && System.currentTimeMillis() - e.ts < TTL) hit = e;
+            }
+            if (hit != null) {
+                final ArrayList<String> l = new ArrayList<String>(hit.lines);
+                final ArrayList<String> b = new ArrayList<String>(hit.labels);
+                if (!quiet) Perf.mark("lines.cache", l.size() + "条");
+                MAIN.post(new Runnable() { public void run() { cb.onLines(l, b); } });
+                return;
+            }
+        }
         try {
             String url = NetConstant.GET_SOURCE + ename;
             final String full = ApiUtils.addParams(act, url);
             OkHttpClientManager.getAsyn(full, new OkHttpClientManager.StringCallback() {
                 public void onFailure(okhttp3.Request r, IOException e) {
+                    synchronized (CACHE) { PENDING.remove(ename); }
+                    if (!quiet) Perf.mark("lines.fail");
                     cb.onError();
                 }
                 public void onResponse(String res) {
@@ -42,16 +104,39 @@ public class OnlineSource {
                             appendPair(lines, labels, b.liveSourceList, b.liveSourceNameList);
                             appendPair(lines, labels, b.backSourceList, b.backSourceNameList);
                         }
-                        if (lines.isEmpty()) cb.onError();
-                        else cb.onLines(lines, labels);
+                        if (lines.isEmpty()) {
+                            synchronized (CACHE) { PENDING.remove(ename); }
+                            if (!quiet) Perf.mark("lines.empty");
+                            cb.onError();
+                            return;
+                        }
+                        Entry e = new Entry();
+                        e.lines = lines;
+                        e.labels = labels;
+                        e.ts = System.currentTimeMillis();
+                        synchronized (CACHE) {
+                            CACHE.put(ename, e);
+                            PENDING.remove(ename);
+                        }
+                        if (!quiet) Perf.mark("lines.net", lines.size() + "条");
+                        cb.onLines(lines, labels);
                     } catch (Throwable t) {
+                        synchronized (CACHE) { PENDING.remove(ename); }
+                        if (!quiet) Perf.mark("lines.err");
                         cb.onError();
                     }
                 }
             });
         } catch (Throwable t) {
+            synchronized (CACHE) { PENDING.remove(ename); }
             cb.onError();
         }
+    }
+
+    /** 强制刷新（忽略缓存） */
+    public static void fetchFresh(Activity act, String ename, final Callback cb) {
+        invalidate(ename);
+        fetch(act, ename, cb, true, false);
     }
 
     private static void appendPair(ArrayList<String> lines, ArrayList<String> labels,
