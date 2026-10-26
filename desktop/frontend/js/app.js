@@ -174,6 +174,12 @@ function showLoading(text) {
     }
   }, 12000);
 }
+/** 只改进度文案，不动 loadingSince（否则会把 12s 慢速提示的计时重置掉） */
+function setLoadingProgress(txt) {
+  const t = $("loadingText");
+  if (t && loadingSince) t.textContent = txt;
+}
+
 function hideLoading() {
   const o = $("loadingOverlay");
   if (o) o.classList.add("hidden");
@@ -266,22 +272,43 @@ function bindFirstFrame() {
   v.addEventListener("playing", onPlayingEvent);
 }
 
-// 首帧看门狗：实测正常首帧 ~2s，超过 5s 还没画面说明这条线路明显慢，
-// 与其干等，不如换下一条（最多换两次，免得在几条慢线之间来回跳）。
+// 首帧看门狗：**按「多久没收到数据」计时，不是按「总耗时」计时**。
+//
+// 这里踩过一个大坑：以前是「点了 5 秒还没画面就换线」。但实测这些源单个分片
+// 3~4.7MB、TTFB 1.0~1.3s，慢一点的宽带上光下完一片就要 6~8 秒 —— 也就是说
+// 线路完全正常，却被 5 秒看门狗判死，于是「才加载一点就换线」，换到下一台
+// 还是同样的分片大小，还是被判死，连换两次才勉强播出来。原版 App 不做这种
+// 提前放弃，所以第一条线路看着很顺。
+//
+// 现在改成：只有**连续 IDLE 秒没有任何一个字节到达**才认为这条线路死了。
+// 只要还在下，就让它下完。
 let firstFrameTimer = null;
 let firstFrameHops = 0;
-const FIRST_FRAME_WAIT = 5000;
+// 只要还有字节在进来，这个计时就会被 kickWatchdog 重置；
+// 15s 完全没数据才判死（正常线路 TTFB 只有 1.1s，绝不会误伤）
+const FIRST_FRAME_IDLE = 15000;
 
 function armFirstFrameWatchdog() {
   if (firstFrameTimer) clearTimeout(firstFrameTimer);
   firstFrameTimer = setTimeout(() => {
     firstFrameTimer = null;
     if (!loadingSince) return;        // 已经出画面了
-    if (firstFrameHops >= 2) return;  // 只折腾两次
+    if (firstFrameHops >= 1) return;  // 最多换一次，别在几条慢线之间来回跳
     firstFrameHops++;
-    onLineFail("首帧超过 " + FIRST_FRAME_WAIT / 1000 + " 秒，换条线路");
-  }, FIRST_FRAME_WAIT);
+    onLineFail("超过 " + FIRST_FRAME_IDLE / 1000 + " 秒没有任何数据，换条线路");
+  }, FIRST_FRAME_IDLE);
 }
+/** 收到任何数据就重新计时：还在下就说明线路活着，不许判死 */
+function kickWatchdog() {
+  // 起播阶段：首帧看门狗按「无数据时长」续命
+  if (loadingSince && firstFrameTimer) armFirstFrameWatchdog();
+  // 播放阶段：缓冲看门狗也按「无数据时长」续命（有字节进来就不算卡死）
+  if (bufferWatchdog) {
+    clearTimeout(bufferWatchdog);
+    bufferWatchdog = setTimeout(() => onLineFail("持续缓冲，自动换线"), BUFFER_STALL_MS);
+  }
+}
+const BUFFER_STALL_MS = 12000;
 
 // ===== 首片预取 =====
 // 实测这些源每片 3~5MB、目标时长 10s（约 3~4Mbps），而 HLS 首帧必须**下完一整片**
@@ -602,9 +629,9 @@ async function playChannel(c) {
     return;
   }
   currentLineIdx = firstPlayable;
-  // 首条线路一确定就先把 CDN 连接预热起来（DNS/TCP/TLS + 清单 + 末两片），
-  // 与 hls.js 的首次请求并行跑。这些源多在海外，一次完整握手就要 200~400ms。
-  prewarmLine(lines[firstPlayable]);
+  // 注意：这里不要「点击时再预取首片」——hls.js 自己会立刻拉同一个清单和分片，
+  // 再预取一份只是多占一条连接和带宽，反而拖慢真正的起播。
+  // 首片预取只在鼠标悬停时做（那时用户还没点，带宽闲着）。
   playLine(currentLineIdx);
 }
 
@@ -689,7 +716,10 @@ async function playLine(i) {
     // kdsvod 线路 302 到真实源站后需 AppleCoreMedia UA 才能拿正常分片（安卓端引擎附加头）
     const APPLE_UA = "AppleCoreMedia/1.0.0.l6F79 (iPhone; U; CPU OS 11_6 like Mac OS X; zh_cn)";
     const hlsCfg = {
-      enableWorker: false,
+      // 解复用放到 Worker 里：单片 3~4.7MB，放主线程每 10 秒会卡一下，
+      // 表现为「播放中轻微顿一下 / 界面响应慢」。Worker 起不来时 hls.js
+      // 会自动回退主线程解析，不会播不了。
+      enableWorker: true,
       // 直播起播点：hls.js 默认要落后 3 个分片才开播。这些源多为 10s/片，
       // 等于白白多等 20~30s。收到 1 片即出画。
       liveSyncDurationCount: 1,
@@ -701,19 +731,37 @@ async function playLine(i) {
       // 别为了估带宽先白拉一片；从最低档起播，出画后再由 ABR 升档
       testBandwidth: false,
       startLevel: 0,
-      // 别死磕重试（默认 4 次指数退避会叠加十几秒），尽快让自动换线接管
-      manifestLoadingMaxRetry: 2,
-      manifestLoadingRetryDelay: 400,
-      manifestLoadingTimeOut: 6000,
-      levelLoadingMaxRetry: 2,
-      levelLoadingTimeOut: 6000,
-      fragLoadingMaxRetry: 2,
-      fragLoadingTimeOut: 8000,
+      // 超时/重试按「真实源站」来定，不是按「理想网络」来定：
+      // 实测单片 3~4.7MB、TTFB 1.0~1.3s，源站偶尔还会 502（上游超时要等满 10s
+      // 才返回）。以前 frag 超时 8s、只重试 2 次，等于把「慢但能播」的线路直接
+      // 枪毙 → 自动换线 → 下一台同样慢 → 再换。这就是「才加载就换线」的由来。
+      // 清单只有几百字节，10s 拿不到基本就是线路死了。
+      manifestLoadingMaxRetry: 3,
+      manifestLoadingRetryDelay: 800,
+      manifestLoadingTimeOut: 10000,
+      levelLoadingMaxRetry: 3,
+      levelLoadingRetryDelay: 800,
+      levelLoadingTimeOut: 15000,
+      // 分片 3~4.7MB，慢宽带下光下载就要 6~8s，给足 25s；真正卡死由
+      // 「无数据 15s」的首帧看门狗管，不靠这个超时
+      fragLoadingMaxRetry: 3,
+      fragLoadingRetryDelay: 800,
+      fragLoadingTimeOut: 25000,
       // 初始带宽估计别太低，避免先播一档低码率再切
       abrEwmaDefaultEstimate: 3000000,
       xhrSetup: (xhr) => {
         xhr.setRequestHeader("User-Agent", isKdsvod ? APPLE_UA : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36");
         xhr.setRequestHeader("Referer", lineReferer);
+        // 每收到一块数据就踢一下看门狗：只要还在下，就不许判这条线路死。
+        // 顺带把「正在下第几 MB」显示出来 —— 单片 3~4MB 要下好几秒，
+        // 光转圈会让人以为卡死了。
+        xhr.addEventListener("progress", (e) => {
+          kickWatchdog();
+          if (!loadingSince || !e || !e.lengthComputable || !e.total || e.total < 204800) return;
+          const mb = (n) => (n / 1048576).toFixed(1);
+          const pct = Math.min(99, Math.round((e.loaded / e.total) * 100));
+          setLoadingProgress(`正在缓冲 ${mb(e.loaded)}MB / ${mb(e.total)}MB（${pct}%）`);
+        });
       },
     };
     // 首片预取命中时直接把内存字节喂给 hls.js，省掉整段 3~5MB 下载；
@@ -735,20 +783,24 @@ async function playLine(i) {
       diag(`hls清单 ${first ? Math.round(first) + "ms/" : ""}${end ? Math.round(end) + "ms" : "?"}`);
     });
     hls.on(Hls.Events.FRAG_LOADED, (_e, d) => {
+      if (!loadingSince) return;   // 只记起播时那一片，否则每 10s 都写一行日志
       const nd = d && d.networkDetails;
       const first = nd && nd.loading ? nd.loading.first : 0;
-      if (first) diag(`hls首片 ${Math.round(first)}ms`);
+      const end = nd && nd.loading ? nd.loading.end : 0;
+      if (first) diag(`hls首片 首字节${Math.round(first)}ms 下载完${Math.round(end)}ms`);
     });
 
     // MANIFEST 到手立刻起播（此时还在下分片），loading 等真正出帧再关
     hls.on(Hls.Events.MANIFEST_PARSED, () => { tryPlayVideo(video); });
 
-    // 任何致命错误 / fragment 加载失败 → 触发换线
+    // 只有 hls.js 判定「致命」才换线。
+    // 坑：fragLoadError / manifestLoadError 在**每次重试**时都会抛一次且 fatal=false，
+    // 以前把它们也当致命，等于把重试配置全废掉 —— 源站抖一下（比如偶尔 502，
+    // 要等满 10s 才返回）就直接换台，看起来就是「才加载就换线」。
     hls.on(Hls.Events.ERROR, (_e, data) => {
-      if (data.fatal || data.details === "fragLoadError" || data.details === "manifestLoadError") {
-        stopWatchdog();
-        onLineFail("线路错误：" + (data.type || data.details));
-      }
+      if (!data || !data.fatal) return;   // 非致命：hls.js 自己在重试，别抢它的活
+      stopWatchdog();
+      onLineFail("线路错误：" + (data.type || data.details));
     });
 
     // 持续缓冲 12s 判卡死 → 换线（对应安卓 bufferWatchdog）
@@ -759,6 +811,7 @@ async function playLine(i) {
     destroyHls();
     video.removeEventListener("waiting", onWaiting);
     video.src = url;
+    video.addEventListener("progress", kickWatchdog);
     bindFirstFrame();
     tryPlayVideo(video);
     video.addEventListener("error", onVideoError);
@@ -769,7 +822,7 @@ async function playLine(i) {
 function onWaiting() {
   if (!autoLine) return;
   if (bufferWatchdog) return;
-  bufferWatchdog = setTimeout(() => onLineFail("持续缓冲，自动换线"), 12000);
+  bufferWatchdog = setTimeout(() => onLineFail("持续缓冲，自动换线"), BUFFER_STALL_MS);
 }
 function stopWatchdog() {
   if (bufferWatchdog) { clearTimeout(bufferWatchdog); bufferWatchdog = null; }
@@ -782,6 +835,8 @@ function onVideoError() {
 // ===== 自动换线 =====
 function onLineFail(reason) {
   stopWatchdog();
+  // 换线原因写进 perf.log：以后判断「是不是又误判慢线」不用猜
+  diag(`换线触发：${reason}（当前第 ${currentLineIdx + 1} 条，已用 ${Math.round(switchT0 ? performance.now() - switchT0 : 0)}ms）`);
   triedLines.add(currentLineIdx);
   if (!autoLine) { hideLoading(); showToast(reason + "（已关闭自动换线）"); showError(reason + "（已关闭自动换线）"); return; }
   const next = lines.findIndex((l, i) => i > currentLineIdx && isPlayable(l) && !triedLines.has(i));
