@@ -8,7 +8,6 @@ mod jsdec;
 mod jsengine;
 mod perf;
 mod source;
-mod tvbus;
 
 use extra::{
     add_custom, get_custom, get_epg, get_favs, import_custom, remove_custom, toggle_fav,
@@ -418,18 +417,6 @@ fn perf_mark(msg: String) {
     perf::log(&format!("[ui] {msg}"));
 }
 
-/// tvbus:// 线路解析：驱动官方 PC 版 P2P 引擎，返回本地 TS 流地址。
-///
-/// 只在用户真正选中该线路时调用——P2P 引擎一次只能跑一路，
-/// 无法像 kdsvod 那样在 get_lines 阶段批量预解析。
-///
-/// 首次启动要等 P2P 网络握手（可能几十秒），必须离开 UI 线程，
-/// 否则整个窗口在这段时间里完全无响应。
-#[tauri::command]
-async fn resolve_tvbus(line: String) -> Result<String, String> {
-    off_ui(move || tvbus::resolve(&line)).await?
-}
-
 /// 命令行测速：`ql-live.exe --bench=8`（配合 QL_PERF=1）。
 ///
 /// 不开窗口，直接跑「取源 + 解析 + 探测」全链路并记录分阶段耗时，
@@ -685,9 +672,7 @@ fn main() {
                     }
                 }
             }
-            // P2P 引擎 init 实测约 90 秒，启动即预热，避免用户首次点 tvbus 台干等
-            std::thread::spawn(|| tvbus::warmup());
-            // 下发算法 JS 的下载/解密/QuickJS 加载也放到常驻线程里做，
+            // 下发算法 JS 的下载/解密/QuickJS 加载放到常驻线程里做，
             // 只做一次，之后所有频道解析复用同一个 Runtime。
             engine_host::prewarm();
             Ok(())
@@ -704,16 +689,10 @@ fn main() {
             add_custom,
             remove_custom,
             import_custom,
-            resolve_tvbus,
             prefetch_lines,
             perf_mark
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
-        .run(|_app, event| {
-            if let tauri::RunEvent::Exit = event {
-                // 别把 tvbus.exe 留成孤儿进程
-                tvbus::shutdown();
-            }
-        });
+        .run(|_app, _event| {});
 }

@@ -561,7 +561,6 @@ async function playChannel(c) {
   cancelPrefetch();
   triedLines = new Set();            // 换频道重置换线记录
   stopWatchdog();
-  destroyTs();                       // 换台先放掉上一路 P2P 流
   holdCurrentFrame();                // 停掉旧台拉流，画面定格，别占带宽
   showLoading("正在获取线路…");
   $("nowTitle").textContent = c.name + (c.nowplay ? " · " + c.nowplay : "");
@@ -578,9 +577,8 @@ async function playChannel(c) {
     $("video").style.display = "none";
     return;
   }
-  // 线路优先级排序：①可播优先 ②已解析(kdsvod/htmlplay)排最前 ③纯直连 http/https 次之 ④rtmp 再次 ⑤tvbus(P2P) ⑥其余垫底
+  // 线路优先级排序：①可播优先 ②已解析(kdsvod/htmlplay)排最前 ③纯直连 http/https 次之 ④rtmp 再次 ⑤其余垫底
   const rank = (l) => {
-    if (l.kind === "tvbus") return 4;                             // P2P 需起流，放最后手段
     if (!l.playable) return 9;
     if (l.kind === "kdsvod" || l.kind === "htmlplay") return 0;   // 已解析、可用性最高
     if (l.kind === "http" || l.kind === "https") return 1;
@@ -595,7 +593,7 @@ async function playChannel(c) {
     invoke("perf_mark", { msg: `快线记忆命中 ${c.name}：原第 ${movedFrom + 1} 条提到首位` }).catch(() => {});
   }
   const firstPlayable = lines.findIndex((l) => isPlayable(l));
-  // 该频道所有线路均不可播（全废，如 tvbus 私有协议 / 废模板）→ 直接给出明确提示，不进入逐线尝试
+  // 该频道所有线路均不可播（源站维护 / 私有协议 / 废模板）→ 直接给出明确提示，不进入逐线尝试
   if (firstPlayable < 0) {
     hideLoading();
     $("video").style.display = "none";
@@ -619,8 +617,7 @@ function renderLines() {
     if (!isPlayable(l)) return;
     const opt = document.createElement("button");
     opt.className = "line-option" + (i === currentLineIdx ? " active" : "");
-    const tag = l.kind === "tvbus" ? " · P2P" : "";
-    opt.innerHTML = `<span class="lo-idx">${i + 1}</span><span class="lo-label">${escapeHtml((l.label || ("线路" + (i + 1))) + tag)}</span>`;
+    opt.innerHTML = `<span class="lo-idx">${i + 1}</span><span class="lo-label">${escapeHtml(l.label || ("线路" + (i + 1)))}</span>`;
     opt.title = l.url;
     opt.onclick = () => { currentLineIdx = i; renderLines(); closeLineMenu(); playLine(i); };
     menu.appendChild(opt);
@@ -635,47 +632,10 @@ function closeLineMenu() { const el = $("lineSelect"); if (el) el.classList.remo
 
 let bufferWatchdog = null;   // 缓冲超时看门狗（12s，与安卓端一致）
 let triedLines = new Set();  // 本轮已尝试过的线路索引（避免死循环）
-let tsPlayer = null;         // tvbus 的 MPEG-TS 播放器（mpegts.js）
 
-/** tvbus:// 线路的 url 不是 http，playable=false，但桌面端能靠 P2P 引擎播 */
+/** 只有后端解析出可直接拉流的地址（http/https/rtmp）才算可播 */
 function isPlayable(l) {
-  return !!(l && (l.playable || l.kind === "tvbus"));
-}
-
-function destroyTs() {
-  if (tsPlayer) {
-    try { tsPlayer.pause(); } catch (e) {}
-    try { tsPlayer.unload(); } catch (e) {}
-    try { tsPlayer.detachMediaElement(); } catch (e) {}
-    try { tsPlayer.destroy(); } catch (e) {}
-    tsPlayer = null;
-  }
-}
-
-/** 播放 tvbus 引擎吐出的本地 TS 流 */
-function playTs(url) {
-  const video = $("video");
-  destroyHls();
-  destroyTs();
-  if (!window.mpegts || !mpegts.getFeatureList().mseLivePlayback) {
-    onLineFail("当前环境不支持 TS 直播播放（MSE 不可用）");
-    return;
-  }
-  video.style.display = "block";
-  $("videoMsg").style.display = "none";
-  tsPlayer = mpegts.createPlayer(
-    { type: "mpegts", isLive: true, url },
-    { enableWorker: true, enableStashBuffer: false, liveBufferLatencyChasing: true, lazyLoad: false }
-  );
-  tsPlayer.attachMediaElement(video);
-  tsPlayer.on(mpegts.Events.ERROR, (_t, d) => {
-    stopWatchdog();
-    onLineFail("P2P 流错误：" + (d || "unknown"));
-  });
-  tsPlayer.load();
-  bindFirstFrame();
-  tsPlayer.play().catch(() => {});
-  video.addEventListener("waiting", onWaiting);
+  return !!(l && l.playable && l.url);
 }
 
 /** 起播封装：WebView 的自动播放策略会拦掉「没有用户手势」的 play
@@ -701,32 +661,12 @@ async function playLine(i) {
   if (!line) return;
   if (!switchT0) switchT0 = performance.now();   // 手动切线路也算一次起播计时
 
-  // tvbus：先让 P2P 引擎起流，再交给 mpegts.js
-  if (line.kind === "tvbus") {
-    $("videoMsg").style.display = "none";
-    $("video").style.display = "block";
-    showLoading("正在连接 P2P 线路…（首次启动需约 1 分钟）");
-    showToast("正在解析：" + (line.label || ("线路" + (i + 1))));
-    let local;
-    try {
-      local = await invoke("resolve_tvbus", { line: line.url });
-    } catch (e) {
-      onLineFail("P2P 线路解析失败：" + e);
-      return;
-    }
-    if (currentLineIdx !== i) return; // 等待期间用户已切走
-    playerT0 = performance.now();
-    playTs(local);
-    return;
-  }
-
   if (!line.playable) {
     $("video").style.display = "none";
     $("videoMsg").style.display = "block";
     setVideoMsg("该线路需二次解析，暂不支持播放（" + (line.kind || "未知") + "）");
     return;
   }
-  destroyTs();
   const url = line.url;
   $("videoMsg").style.display = "none";
   const video = $("video");
