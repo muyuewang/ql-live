@@ -1,40 +1,70 @@
 #!/bin/bash
-# Build youtu myui APK: compile -> dex -> apktool b -> inject dex+asset -> sign
+# Build youtu myui APK: compile -> dex -> apktool b -> inject dex -> sign
+#
+# 2026-10-27 目录重组后：源码在 code/android/src，工具在 code/tools/，
+# 反编译工程在 悠兔/out/decompile/proj2，产物落 悠兔/out/artifacts/build。
+# 这里按脚本自身位置推导根目录，不再硬编码绝对路径。
 set -e
-cd /c/Users/fengxin/youtu_work/android
-J=/d/devtool/jdk-21.0.4/bin
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ANDROID="$(cd "$HERE/.." && pwd)"        # code/android
+CODE="$(cd "$ANDROID/.." && pwd)"        # code
+WS="$(cd "$CODE/.." && pwd)"             # 悠兔（工作空间）
+cd "$CODE"
+
+J=${JAVA_HOME_BIN:-/d/devtool/jdk-21.0.4/bin}
+PY="${PYTHON_BIN:-/c/Users/fengxin/.workbuddy/binaries/python/versions/3.13.12/python.exe}"
+APKTOOL="C:/Users/fengxin/Tools/apktool/apktool.jar"
+AJ=tools/toolchain/android-all.jar
+BUILD=android/build_tmp
+PROJ="$WS/out/decompile/proj2"
+OUTDIR="$WS/out/artifacts/build"
+
+mkdir -p "$BUILD" "$OUTDIR"
+
 echo "== javac stubs =="
-rm -rf out_stub && mkdir out_stub
-$J/javac -encoding UTF-8 -source 8 -target 8 -nowarn -cp "../toolchain/android-all.jar" -d out_stub $(find src_stub -name "*.java") 2>&1 | head -3
-[ -f out_stub/com/jiaoxiang/fangnale/utils/AesUtil.class ] || { echo STUB_COMPILE_FAILED; exit 1; }
+rm -rf "$BUILD/out_stub" && mkdir -p "$BUILD/out_stub"
+$J/javac -encoding UTF-8 -source 8 -target 8 -nowarn -cp "$AJ" -d "$BUILD/out_stub" \
+  $(find android/src_stub -name "*.java") 2>&1 | head -3
+[ -f "$BUILD/out_stub/com/jiaoxiang/fangnale/utils/AesUtil.class" ] || { echo STUB_COMPILE_FAILED; exit 1; }
+
 echo "== javac =="
-rm -rf out_cls && mkdir out_cls
-$J/javac -encoding UTF-8 -source 8 -target 8 -nowarn -cp "out_stub;../toolchain/android-all.jar" -d out_cls $(find src -name "*.java") 2>&1 | grep -v "deprecat\|Xlint" | head -5
-ls out_cls/com/muyue/ql/myui/MainActivity.class > /dev/null || { echo COMPILE_FAILED; exit 1; }
-ls out_cls/com/muyue/ql/myui/PlayerEngine.class > /dev/null || { echo COMPILE_FAILED_ENGINE; exit 1; }
-ls out_cls/com/muyue/ql/myui/OnlineSource.class > /dev/null || { echo COMPILE_FAILED_SOURCE; exit 1; }
+rm -rf "$BUILD/out_cls" && mkdir -p "$BUILD/out_cls"
+$J/javac -encoding UTF-8 -source 8 -target 8 -nowarn -cp "$BUILD/out_stub;$AJ" -d "$BUILD/out_cls" \
+  $(find android/src -name "*.java") 2>&1 | grep -v "deprecat\|Xlint" | head -5
+for c in MainActivity PlayerEngine OnlineSource; do
+  [ -f "$BUILD/out_cls/com/muyue/ql/myui/$c.class" ] || { echo "COMPILE_FAILED: $c"; exit 1; }
+done
+
 echo "== d8 =="
-rm -f classes7.dex classes.dex
-$J/java -cp ../toolchain/d8.jar com.android.tools.r8.D8 --release --min-api 21 --output . $(find out_cls -name "*.class") 2>/dev/null | head -3 || true
-mv classes.dex classes7.dex
-cd /c/Users/fengxin/youtu_work
+rm -f "$BUILD/classes7.dex" "$BUILD/classes.dex"
+$J/java -cp tools/toolchain/d8.jar com.android.tools.r8.D8 --release --min-api 21 \
+  --output "$BUILD" $(find "$BUILD/out_cls" -name "*.class") 2>/dev/null | head -3 || true
+mv "$BUILD/classes.dex" "$BUILD/classes7.dex"
+
 echo "== apktool b =="
-rm -rf proj2/build
-java -jar C:/Users/fengxin/Tools/apktool/apktool.jar b proj2 -o youtu_myui_base.apk > apktool_myui.log 2>&1 || { tail -5 apktool_myui.log; exit 1; }
+BASE="$OUTDIR/youtu_myui_base.apk"
+rm -rf "$PROJ/build"
+java -jar "$APKTOOL" b "$PROJ" -o "$BASE" > "$WS/log/build/apktool_myui.log" 2>&1 \
+  || { tail -5 "$WS/log/build/apktool_myui.log"; exit 1; }
+
 echo "== inject =="
-C:/Users/fengxin/.workbuddy/binaries/python/envs/default/Scripts/python.exe - << 'EOF'
-import zipfile
-base = 'youtu_myui_base.apk'
-out = 'youtu_myui_signed.apk'
+SIGNED="$OUTDIR/youtu_myui_signed.apk"
+"$PY" - "$BASE" "$SIGNED" "$BUILD/classes7.dex" << 'EOF'
+import sys, zipfile
+base, out, dexpath = sys.argv[1], sys.argv[2], sys.argv[3]
 zin = zipfile.ZipFile(base)
 with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as zo:
     for info in zin.infolist():
         zo.writestr(zipfile.ZipInfo(info.filename, (2026, 10, 16, 0, 0, 0)), zin.read(info.filename))
     zi = zipfile.ZipInfo('classes7.dex', (2026, 10, 16, 0, 0, 0))
     zi.external_attr = 0o644 << 16
-    zo.writestr(zi, open('android/classes7.dex', 'rb').read())
+    zo.writestr(zi, open(dexpath, 'rb').read())
 print('inject ok')
 EOF
+
 echo "== sign =="
-java -jar uber-apk-signer.jar -a youtu_myui_signed.apk --ks ks_new.jks --ksAlias youtu --ksPass 123456 --ksKeyPass 123456 --overwrite 2>&1 | grep -E "sign success|ERROR"
+java -jar tools/uber-apk-signer.jar -a "$SIGNED" \
+  --ks android/keys/ks_new.jks --ksAlias youtu --ksPass 123456 --ksKeyPass 123456 --overwrite \
+  2>&1 | grep -E "sign success|ERROR|Successfully"
 echo BUILD_DONE

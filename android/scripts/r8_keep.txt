@@ -1,0 +1,7 @@
+-keep class com.jiaoxiang.fangnale.MyApplication { *; }
+-keep class com.jiaoxiang.fangnale.myui.** { *; }
+-keep class android.support.** { *; }
+-keep class androidx.** { *; }
+-dontobfuscate
+-dontwarn **
+-keepattributes *Annotation*,Signature,InnerClasses,EnclosingMethod

@@ -1,18 +1,41 @@
+# ---- 构建产物 / 中间产物 ----
 *.apk
 *.dex
 *.class
+*.idsig
 out_cls/
 out_stub/
 build/
+build_tmp/
 original/
 unknown/
+
+# ---- 密钥与证书（不入库）----
 *.jks
 *.keystore
 keystore*
+*.p12
+*.pem
+*.der
+/android/keys/
+
+# ---- 日志 ----
 *.log
 .DS_Store
 
-# Desktop (Tauri/Rust) build artifacts
+# ---- 反编译工程（84MB / 7752 文件，apktool 可重新生成，不入库）----
+# lite_smali 里 99.9% 是 apktool 从原包反编译出的第三方代码，批量入库没有意义。
+# 唯一需要长期保留的是**手工 smali 补丁**，已单独抽到 android/patches/ 下：
+#   patches/JsLayer.smali —— Parser.init 复用 WebView（v2.5.0 切台加速第二件套）
+# 重新解包后用 scripts/apply_patches.sh 把补丁覆盖回去即可。
+/android/lite_smali/
+
+# ---- 第三方工具链（体积大，按 README 自行下载）----
+/tools/toolchain/
+/tools/uber-apk-signer.jar
+/tools/smali.jar
+
+# ---- Desktop (Tauri/Rust) build artifacts ----
 /desktop/src-tauri/target/
 /desktop/frontend/node_modules/
 /desktop/dist/

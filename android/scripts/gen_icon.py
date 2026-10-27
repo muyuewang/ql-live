@@ -18,7 +18,7 @@ def make_icon(size):
     d.polygon([(left, top), (left, top + th), (left + tw, cy)], fill=(255, 255, 255, 255))
     return img
 
-base = r"C:/Users/fengxin/youtu_work/proj2/res"
+base = r"C:/Users/fengxin/WorkBuddy/悠兔/out/decompile/proj2/res"
 targets = [
     (os.path.join(base, "drawable-hdpi", "ic_launcher.png"), 72),
     (os.path.join(base, "drawable-xxhdpi", "ic_launcher1.png"), 144),
