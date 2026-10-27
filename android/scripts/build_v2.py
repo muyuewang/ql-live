@@ -1,8 +1,13 @@
 import zipfile, os, glob, hashlib, zlib, struct
 
+# out/ 按月归档：优先用环境变量 OUT_MONTH，否则取 out/ 下最新的 YYYY-MM 目录
+_WS = r"C:/Users/fengxin/WorkBuddy/悠兔"
+_m = sorted(os.path.basename(p) for p in glob.glob(os.path.join(_WS, "out", "20??-??")))
+_O = os.path.join(_WS, "out", os.environ.get("OUT_MONTH") or _m[-1])
+
 SRC = r"C:/Users/fengxin/Downloads/悠兔电视.apk"
-DUMP = r"C:/Users/fengxin/WorkBuddy/悠兔/out/decompile/dexdump"
-OUT = r"C:/Users/fengxin/WorkBuddy/悠兔/out/artifacts/youtu_dumped.apk"
+DUMP = os.path.join(_O, "decompile/dexdump")
+OUT = os.path.join(_O, "artifacts/youtu_dumped.apk")
 
 def drop(name):
     if name.startswith("META-INF/") and (name.endswith((".RSA", ".SF", ".MF", ".DSA")) or "PANGLEDY" in name):

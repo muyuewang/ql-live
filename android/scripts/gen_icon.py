@@ -1,5 +1,11 @@
-from PIL import Image, ImageDraw
 import os
+import sys
+
+from PIL import Image, ImageDraw
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _paths import PROJ2
+
 
 def make_icon(size):
     s = size
@@ -18,7 +24,12 @@ def make_icon(size):
     d.polygon([(left, top), (left, top + th), (left + tw, cy)], fill=(255, 255, 255, 255))
     return img
 
-base = r"C:/Users/fengxin/WorkBuddy/悠兔/out/decompile/proj2/res"
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _paths import PROJ2
+
+base = os.path.join(PROJ2, "res")
 targets = [
     (os.path.join(base, "drawable-hdpi", "ic_launcher.png"), 72),
     (os.path.join(base, "drawable-xxhdpi", "ic_launcher1.png"), 144),

@@ -11,11 +11,19 @@ CODE="$(cd "$ANDROID/.." && pwd)"        # code
 WS="$(cd "$CODE/.." && pwd)"             # 悠兔（工作空间）
 cd "$CODE"
 
+# out/ 按月归档（out/2026-10/...）。默认取最新月份目录，
+# 需要写历史月份时用 OUT_MONTH=2026-09 bash build_all.sh 覆盖。
+OUTMONTH="${OUT_MONTH:-$(ls -1d "$WS"/out/20??-?? 2>/dev/null | sort | tail -1 | xargs -r basename)}"
+[ -n "$OUTMONTH" ] || { echo "找不到 out/YYYY-MM 目录，请先 mkdir -p \"$WS/out/$(date +%Y-%m)\""; exit 1; }
+OUT="$WS/out/$OUTMONTH"
+echo "out 归档月：$OUTMONTH"
+
 PY="${PYTHON_BIN:-/c/Users/fengxin/.workbuddy/binaries/python/versions/3.13.12/python.exe}"
 APK="C:/Users/fengxin/Tools/apktool/apktool.jar"
-DUMPED="$WS/out/artifacts/youtu_dumped.apk"
-PROJ="$WS/out/decompile/proj2"
-OUTAPK="$WS/out/artifacts/build/youtu_v2.apk"
+DUMPED="$OUT/artifacts/youtu_dumped.apk"
+PROJ="$OUT/decompile/proj2"
+OUTAPK="$OUT/artifacts/build/youtu_v2.apk"
+export OUT_MONTH="$OUTMONTH"   # 传给被调用的 python 脚本
 
 echo "==== 1) 合成 dumped apk ===="
 "$PY" android/scripts/build_v2.py

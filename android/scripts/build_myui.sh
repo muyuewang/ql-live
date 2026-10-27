@@ -2,7 +2,7 @@
 # Build youtu myui APK: compile -> dex -> apktool b -> inject dex -> sign
 #
 # 2026-10-27 目录重组后：源码在 code/android/src，工具在 code/tools/，
-# 反编译工程在 悠兔/out/decompile/proj2，产物落 悠兔/out/artifacts/build。
+# 反编译工程在 悠兔/out/<YYYY-MM>/decompile/proj2，产物落 悠兔/out/<YYYY-MM>/artifacts/build。
 # 这里按脚本自身位置推导根目录，不再硬编码绝对路径。
 set -e
 
@@ -17,10 +17,19 @@ PY="${PYTHON_BIN:-/c/Users/fengxin/.workbuddy/binaries/python/versions/3.13.12/p
 APKTOOL="C:/Users/fengxin/Tools/apktool/apktool.jar"
 AJ=tools/toolchain/android-all.jar
 BUILD=android/build_tmp
-PROJ="$WS/out/decompile/proj2"
-OUTDIR="$WS/out/artifacts/build"
 
-mkdir -p "$BUILD" "$OUTDIR"
+# out/ 按月归档（out/2026-10/...）。默认取最新月份目录，
+# 需要写历史月份时用 OUT_MONTH=2026-09 bash build_myui.sh 覆盖。
+OUTMONTH="${OUT_MONTH:-$(ls -1d "$WS"/out/20??-?? 2>/dev/null | sort | tail -1 | xargs -r basename)}"
+[ -n "$OUTMONTH" ] || { echo "找不到 out/YYYY-MM 目录，请先 mkdir -p \"$WS/out/$(date +%Y-%m)\""; exit 1; }
+OUT="$WS/out/$OUTMONTH"
+echo "out 归档月：$OUTMONTH"
+
+PROJ="$OUT/decompile/proj2"
+OUTDIR="$OUT/artifacts/build"
+LOGDIR="$WS/log/debug/build"
+
+mkdir -p "$BUILD" "$OUTDIR" "$LOGDIR"
 
 echo "== javac stubs =="
 rm -rf "$BUILD/out_stub" && mkdir -p "$BUILD/out_stub"
@@ -45,8 +54,8 @@ mv "$BUILD/classes.dex" "$BUILD/classes7.dex"
 echo "== apktool b =="
 BASE="$OUTDIR/youtu_myui_base.apk"
 rm -rf "$PROJ/build"
-java -jar "$APKTOOL" b "$PROJ" -o "$BASE" > "$WS/log/build/apktool_myui.log" 2>&1 \
-  || { tail -5 "$WS/log/build/apktool_myui.log"; exit 1; }
+java -jar "$APKTOOL" b "$PROJ" -o "$BASE" > "$LOGDIR/apktool_myui.log" 2>&1 \
+  || { tail -5 "$LOGDIR/apktool_myui.log"; exit 1; }
 
 echo "== inject =="
 SIGNED="$OUTDIR/youtu_myui_signed.apk"

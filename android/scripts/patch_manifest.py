@@ -1,6 +1,9 @@
-import re, sys, io
+import re, sys, io, os
 
-P = r"C:/Users/fengxin/WorkBuddy/悠兔/out/decompile/proj2/AndroidManifest.xml"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _paths import PROJ2
+
+P = os.path.join(PROJ2, "AndroidManifest.xml")
 s = open(P, encoding="utf-8").read()
 
 # 1) 去掉加固壳 Application -> 真实 Application

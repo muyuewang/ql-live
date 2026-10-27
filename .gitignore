@@ -39,3 +39,6 @@ keystore*
 /desktop/src-tauri/target/
 /desktop/frontend/node_modules/
 /desktop/dist/
+# Python 缓存
+__pycache__/
+*.pyc

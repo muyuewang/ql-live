@@ -1,6 +1,9 @@
-import re, os, json
+import re, os, json, sys
 
-PROJ = r"C:/Users/fengxin/WorkBuddy/悠兔/out/decompile/proj2"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _paths import PROJ2
+
+PROJ = PROJ2
 LAY = os.path.join(PROJ, "res/layout/activity_shequ.xml")
 s = open(LAY, encoding="utf-8").read()
 orig = s

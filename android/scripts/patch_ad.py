@@ -1,6 +1,8 @@
 import zipfile, os, re, subprocess, shutil, sys
 
-W = r"C:/Users/fengxin/WorkBuddy/悠兔/out/artifacts"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _paths import ARTIFACTS as W, PROJ2
+
 APKTOOL = r"C:/Users/fengxin/Tools/apktool/apktool.jar"
 
 # 1) 构造只含"应用 dex"的 mini apk (复用原包的资源/清单)
@@ -57,6 +59,6 @@ print("rebuilt:", os.path.getsize(out))
 # 5) 取出新 dex, 覆盖 proj2 里的 classes3.dex
 newz = zipfile.ZipFile(out)
 newdex = newz.read("classes.dex")
-dst = os.path.join(W, "proj2", "classes3.dex")
+dst = os.path.join(PROJ2, "classes3.dex")
 open(dst, "wb").write(newdex)
 print("wrote proj2/classes3.dex", len(newdex))
