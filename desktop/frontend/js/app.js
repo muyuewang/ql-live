@@ -257,7 +257,11 @@ function tier(l) {
 
 // 起播后让后端把该频道线路表「全量解析」一遍落缓存（只拉清单，每条约 1KB）。
 // 点击路径为了快只解析前几条，低码率线路常常不在里面；升级后下次切回来就能选到快线。
+//
+// ⚠️ 只能在**首帧出来之后**调用：全量解析会并发拉十几条线路的清单，
+// 起播瞬间调用会把首片下载带宽抢掉（v1.3.5 的回归就是这么来的）。
 const upgradingLines = new Set();
+let pendingUpgrade = "";          // 首帧出画后要补全解析的频道（空=没有）
 function upgradeLinesCache(ename) {
   if (!ename || upgradingLines.has(ename)) return;
   // 同一时间只升级一个频道：连点换台时不要堆出十几路后台解析
@@ -302,6 +306,16 @@ function markFirstFrame(tag) {
     invoke("perf_mark", { msg: `首帧(${tag}) ${ch} 总${ms}ms（播放器 ${pl}ms）` }).catch(() => {});
     switchT0 = 0;
   }
+  // 出画了才去后台补全线路解析。再等 8s，让播放器先攒够缓冲
+  // （首片 3~5MB、慢节点 30~40KB/s，刚出画时缓冲还很薄，立刻并发拉清单会卡顿）。
+  if (pendingUpgrade) {
+    const ename = pendingUpgrade;
+    pendingUpgrade = "";
+    setTimeout(() => {
+      // 期间又换台了就放弃，别给已经不在看的频道浪费带宽
+      if (currentChannel && currentChannel.ename === ename) upgradeLinesCache(ename);
+    }, 8000);
+  }
 }
 
 function onPlayingEvent() {
@@ -329,41 +343,101 @@ function bindFirstFrame() {
   v.addEventListener("playing", onPlayingEvent);
 }
 
-// 首帧看门狗：**按「多久没收到数据」计时，不是按「总耗时」计时**。
+// 首帧看门狗：**双判据** —— 「多久没收到数据」+「总共等了多久」。
 //
-// 这里踩过一个大坑：以前是「点了 5 秒还没画面就换线」。但实测这些源单个分片
-// 3~4.7MB、TTFB 1.0~1.3s，慢一点的宽带上光下完一片就要 6~8 秒 —— 也就是说
-// 线路完全正常，却被 5 秒看门狗判死，于是「才加载一点就换线」，换到下一台
-// 还是同样的分片大小，还是被判死，连换两次才勉强播出来。原版 App 不做这种
-// 提前放弃，所以第一条线路看着很顺。
+// 这里踩过两个坑：
 //
-// 现在改成：只有**连续 IDLE 秒没有任何一个字节到达**才认为这条线路死了。
-// 只要还在下，就让它下完。
+// 坑一（已修）：以前是「点了 5 秒还没画面就换线」。但实测这些源单个分片
+// 3~5MB、TTFB 1.0~1.3s，慢一点的宽带上光下完一片就要 6~8 秒 —— 线路完全
+// 正常却被 5 秒看门狗判死，于是「才加载一点就换线」。
+//
+// 坑二（v1.3.6 修，就是「除 CCTV-1 都播不了」的真凶）：只按「无数据时长」
+// 计时，对**限速型慢节点**完全失效。实测某 CDN 节点给到 29~41KB/s，一片
+// 5.15MB 要下 94~180 秒；它一直在吐字节，于是每次 progress 都把计时器续命，
+// 看门狗永不触发 → 画面永远不出来，日志里既没有首帧也没有换线，表现为
+// 「切了台就卡死」。所以必须再加一条**绝对时长上限**：到点就换，不管有没有数据。
 let firstFrameTimer = null;
 let firstFrameHops = 0;
-// 只要还有字节在进来，这个计时就会被 kickWatchdog 重置；
-// 15s 完全没数据才判死（正常线路 TTFB 只有 1.1s，绝不会误伤）
-const FIRST_FRAME_IDLE = 15000;
+let firstFrameT0 = 0;             // 本次起播交给播放器的时刻（绝对上限的起点）
+let lastDataAt = 0;               // 最近一次收到字节的时刻（用来区分「没数据」还是「太慢」）
+// 完全没有任何字节到达多久判死（正常线路 TTFB 只有 1.1s，绝不会误伤）
+const FIRST_FRAME_IDLE = 10000;
+// 绝对上限：从交给播放器算起，这么久还没出第一帧就换线。
+// 实测快节点 1.2s 出画，15s 足够；慢节点 15s 连 1/3 片都下不完，留着也没用。
+const FIRST_FRAME_HARD = 15000;
+// 允许连续换几条：源站慢节点多时需要多试几条，但也要防死循环
+const FIRST_FRAME_MAX_HOPS = 4;
+
+/** 到点判死：原因按「最近是否还有字节进来」区分，日志才看得懂 */
+function judgeFirstFrameTimeout() {
+  firstFrameTimer = null;
+  if (!loadingSince) return;                 // 已出画
+  const idle = performance.now() - (lastDataAt || firstFrameT0);
+  const why = idle >= FIRST_FRAME_IDLE * 0.7
+    ? `超过 ${FIRST_FRAME_IDLE / 1000} 秒没有任何数据`
+    : `超过 ${FIRST_FRAME_HARD / 1000} 秒未出画面（线路太慢）`;
+  if (firstFrameHops >= FIRST_FRAME_MAX_HOPS) {
+    // 试够条数仍然不行：必须收掉转圈并说清原因，否则界面就永远转下去了
+    hideLoading();
+    $("video").style.display = "none";
+    $("videoMsg").style.display = "block";
+    setVideoMsg(`已连续试了 ${FIRST_FRAME_MAX_HOPS} 条线路都无法起播（${why}）。`
+      + "源站当前较慢或限流，请稍后重试、换频道，或手动选择其他线路。");
+    return;
+  }
+  firstFrameHops++;
+  onLineFail(why + "，换条线路");
+}
 
 function armFirstFrameWatchdog() {
   if (firstFrameTimer) clearTimeout(firstFrameTimer);
-  firstFrameTimer = setTimeout(() => {
-    firstFrameTimer = null;
-    if (!loadingSince) return;        // 已经出画面了
-    if (firstFrameHops >= 1) return;  // 最多换一次，别在几条慢线之间来回跳
-    firstFrameHops++;
-    onLineFail("超过 " + FIRST_FRAME_IDLE / 1000 + " 秒没有任何数据，换条线路");
-  }, FIRST_FRAME_IDLE);
+  if (!firstFrameT0) firstFrameT0 = performance.now();
+  const left = FIRST_FRAME_HARD - (performance.now() - firstFrameT0);
+  if (left <= 0) { judgeFirstFrameTimeout(); return; }   // 已超绝对上限，不再续命
+  // 等待时长取「无数据上限」与「剩余硬上限」的较小值：
+  // 数据断了 10s 判死；数据一直在来但慢，也会在硬上限到点时被判死。
+  firstFrameTimer = setTimeout(judgeFirstFrameTimeout, Math.max(1000, Math.min(FIRST_FRAME_IDLE, left)));
 }
 /** 收到任何数据就重新计时：还在下就说明线路活着，不许判死 */
 function kickWatchdog() {
-  // 起播阶段：首帧看门狗按「无数据时长」续命
+  // 记录最近收到字节的时刻：超时判死时用它区分「没数据」和「数据慢」
+  if (loadingSince) lastDataAt = performance.now();
+  // 起播阶段：首帧看门狗按「无数据时长」续命（但仍受绝对硬上限约束）
   if (loadingSince && firstFrameTimer) armFirstFrameWatchdog();
   // 播放阶段：缓冲看门狗也按「无数据时长」续命（有字节进来就不算卡死）
   if (bufferWatchdog) {
     clearTimeout(bufferWatchdog);
     bufferWatchdog = setTimeout(() => onLineFail("持续缓冲，自动换线"), BUFFER_STALL_MS);
   }
+}
+
+// ===== 起播速度探测：太慢的线路不必等满硬上限 =====
+// 实测源站不同 CDN 节点速度差 100 倍：快的 3MB/s（1.2s 出画），
+// 慢的只有 29~41KB/s（一片 5MB 要 94~180s，永远出不来）。
+// 只靠「15s 硬上限」也能跳过慢节点，但要干等 15s；这里按实测速度提前判死：
+//   - 已下 >300KB 且平均速度 <60KB/s → 一片 3MB 要 50s，判定「太慢」立刻换线
+//   - 至少下够 300KB 才判，避免刚起步的瞬间抖动误杀
+//   - 判过一次就不再重复判（firstFrameHops 统一计数）
+let startupBytes = 0;
+let startupT0 = 0;
+let startupSlowJudged = false;
+const STARTUP_MIN_BYTES = 300 * 1024;
+const STARTUP_MIN_SPEED = 60 * 1024;   // B/s
+
+function trackStartupSpeed(e) {
+  if (!loadingSince || startupSlowJudged) return;      // 已出画 / 已判过
+  if (!startupT0) startupT0 = performance.now();
+  if (e && typeof e.loaded === "number" && e.loaded > startupBytes) startupBytes = e.loaded;
+  const dt = performance.now() - startupT0;
+  if (dt < 2500 || startupBytes < STARTUP_MIN_BYTES) return;   // 采样太短不判
+  const speed = startupBytes / (dt / 1000);
+  if (speed >= STARTUP_MIN_SPEED) return;
+  startupSlowJudged = true;
+  // 计入换线次数，和超时判死共用同一个预算，避免「太快→换→还是快→再换」绕圈
+  if (firstFrameHops >= FIRST_FRAME_MAX_HOPS) return;
+  firstFrameHops++;
+  const kb = Math.round(speed / 1024);
+  onLineFail(`线路太慢（${kb}KB/s，一片要下 ${Math.round(3 * 1024 / kb)}s 以上），换条线路`);
 }
 const BUFFER_STALL_MS = 12000;
 
@@ -640,7 +714,7 @@ async function playChannel(c) {
   currentChannel = c;
   switchT0 = performance.now();
   playerT0 = 0;
-  firstFrameHops = 0;                // 每个频道重新给两次换线机会
+  firstFrameHops = 0;                // 每个频道重置换线预算（FIRST_FRAME_MAX_HOPS 条）
   renderChannels();
   cancelPrefetch();
   triedLines = new Set();            // 换频道重置换线记录
@@ -693,9 +767,12 @@ async function playChannel(c) {
   // 再预取一份只是多占一条连接和带宽，反而拖慢真正的起播。
   // 首片预取只在鼠标悬停时做（那时用户还没点，带宽闲着）。
   playLine(currentLineIdx);
-  // 起播后再让后端把这个频道「全量解析」一遍落到缓存里：点击路径只解析了前几条，
-  // 低码率线路常常不在其中。下次切回本频道（或悬停时）就能直接选到快线。
-  if (fastStart) upgradeLinesCache(c.ename);
+  // 注意：全量解析（prefetch_lines）**必须等首帧出来之后**再做。
+  // v1.3.5 是在这里直接调用的，结果切台瞬间就并发解析十几条线路，
+  // 把首片下载带宽抢光 —— 实测慢节点本身只有 29~41KB/s，一片 5MB，
+  // 再被抢带宽就永远出不来画面。这是「除 CCTV-1 外都播不了」的直接原因。
+  // 现在挂到首帧回调里（见 markFirstFrame），出画后再后台补全。
+  pendingUpgrade = fastStart ? c.ename : "";
 }
 
 function renderLines() {
@@ -762,6 +839,11 @@ async function playLine(i) {
   const video = $("video");
   video.style.display = "block";
   playerT0 = performance.now();
+  firstFrameT0 = 0;          // 每条线路都拿到完整的首帧预算（绝对上限从本条线起算）
+  lastDataAt = 0;            // 本条线还没收到字节
+  startupBytes = 0;          // 起播速度采样按线路重置，不能跨线累计
+  startupT0 = 0;
+  startupSlowJudged = false;
   showLoading("加载线路中…（" + (line.label || ("线路" + (i + 1))) + "）");
   showToast("正在播放：" + (line.label || ("线路" + (i + 1))));
 
@@ -773,6 +855,12 @@ async function playLine(i) {
   // 线路可能携带所需 Referer（htmlplay 解析后），以及 kdsvod 需 AppleCoreMedia UA
   const lineReferer = line.referer || "http://sjapi.91kds.cn/";
   const isKdsvod = line.kind === "kdsvod";
+
+  // 分支自证：以前日志里只能看到「选线」和「首帧」，中间走了哪条路完全不知道。
+  // 排「除 CCTV-1 都播不了」时就是因为缺这一行，无法判断是 hls.js 没加载、
+  // 还是走了原生 video 分支。以后一眼可见。
+  diag(`播放分支 ${isHls ? "hls" : "非hls"} / native=${canNativeHls ? "支持" : "不支持"}`
+    + ` / Hls=${window.Hls ? (Hls.isSupported() ? "可用" : "不支持MSE") : "未加载"}`);
 
   if (isHls && !canNativeHls && window.Hls && Hls.isSupported()) {
     destroyHls();
@@ -820,6 +908,7 @@ async function playLine(i) {
         // 光转圈会让人以为卡死了。
         xhr.addEventListener("progress", (e) => {
           kickWatchdog();
+          trackStartupSpeed(e);
           if (!loadingSince || !e || !e.lengthComputable || !e.total || e.total < 204800) return;
           const mb = (n) => (n / 1048576).toFixed(1);
           const pct = Math.min(99, Math.round((e.loaded / e.total) * 100));
